@@ -7,19 +7,14 @@
     <title>文转大师 · 文档转换器</title>
 
     <!-- Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.tailwindcss.com/"></script>
 
-    <!-- 核心依赖库（使用高可用性 CDN） -->
-    <!-- jsPDF (用于生成 PDF) -->
+    <!-- 核心依赖库（使用高可用 CDN） -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-    <!-- JSZip (用于生成 EPUB) -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-    <!-- html2canvas (用于渲染中文 PDF) -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-    <!-- PDF.js (用于解析 PDF) - 使用稳定的 3.11.174 版本 -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-    <!-- epub.js (用于解析 EPUB) -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/epub.js/0.3.93/epub.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js"></script>
 
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
@@ -31,7 +26,6 @@
 </head>
 <body class="bg-gray-50 min-h-screen flex flex-col items-center py-8 px-4">
 
-    <!-- 头部 -->
     <header class="text-center mb-8 max-w-2xl">
         <h1 class="text-4xl font-bold text-gray-800 mb-1 flex items-center justify-center gap-2">
             <span>📄</span> 文转大师
@@ -39,7 +33,6 @@
         <p class="text-gray-500 text-sm">PDF · EPUB · TXT · MOBI 互转 · 纯本地 · 无上传</p>
     </header>
 
-    <!-- 主卡片 -->
     <main class="w-full max-w-2xl bg-white rounded-2xl shadow-lg p-6 md:p-8 space-y-6">
         <!-- 上传区域 -->
         <div id="dropZone" class="border-2 border-dashed border-gray-300 rounded-xl p-10 text-center cursor-pointer transition-colors hover:border-blue-400 hover:bg-blue-50">
@@ -71,8 +64,9 @@
                     <option value="txt">TXT (纯文本)</option>
                     <option value="pdf">PDF (文档)</option>
                     <option value="epub">EPUB (电子书)</option>
-                    <option value="mobi">MOBI (Kindle)</option>
+                    <option value="mobi">MOBI (Kindle邮箱推送)</option>
                 </select>
+                <p class="text-xs text-gray-500 mt-1" id="formatHint"></p>
             </div>
             <button id="convertBtn" disabled class="w-full sm:w-40 bg-blue-600 text-white py-2.5 px-5 rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2 h-11">
                 <span id="btnText">开始转换</span>
@@ -113,14 +107,30 @@
     </footer>
 
     <script>
-        // ============ 初始化 ============
         (function() {
             'use strict';
 
-            // ----- 配置 PDF.js Worker -----
-            if (window.pdfjsLib) {
-                pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+            // ----- 库加载检查 -----
+            function checkLibraries() {
+                const missing = [];
+                if (!window.jspdf) missing.push('jsPDF');
+                if (!window.JSZip) missing.push('JSZip');
+                if (!window.html2canvas) missing.push('html2canvas');
+                if (!window.pdfjsLib) missing.push('PDF.js');
+                if (!window.ePub) missing.push('epub.js');
+                if (missing.length > 0) {
+                    throw new Error(`必需库未加载: ${missing.join(', ')}`);
+                }
             }
+            try {
+                checkLibraries();
+            } catch (e) {
+                document.body.innerHTML = `<div style="padding:20px;text-align:center;color:red;font-size:18px;">${e.message}<br>请刷新页面重试</div>`;
+                return;
+            }
+
+            // 配置 PDF.js Worker
+            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
             // ----- DOM 引用 -----
             const dropZone = document.getElementById('dropZone');
@@ -141,6 +151,7 @@
             const resetBtn = document.getElementById('resetBtn');
             const historyArea = document.getElementById('historyArea');
             const historyList = document.getElementById('historyList');
+            const formatHint = document.getElementById('formatHint');
 
             // ----- 状态 -----
             let currentFile = null;
@@ -148,7 +159,18 @@
             let isConverting = false;
             let lastDownloadUrl = null;
 
-            // ----- 辅助函数 -----
+            // ----- 辅助提示 -----
+            const formatHints = {
+                'txt': '通用纯文本格式',
+                'pdf': '适合打印和固定排版',
+                'epub': '适合手机和电子书阅读器',
+                'mobi': '适用于 Kindle 邮箱推送（生成 HTML 结构，服务端会自动转换）'
+            };
+            targetFormat.addEventListener('change', (e) => {
+                formatHint.textContent = formatHints[e.target.value] || '';
+            });
+            targetFormat.dispatchEvent(new Event('change'));
+
             function showStatus(msg, type = 'info') {
                 statusText.textContent = msg;
                 progressArea.classList.remove('hidden');
@@ -242,26 +264,57 @@
             removeFileBtn.addEventListener('click', resetUI);
             resetBtn.addEventListener('click', resetUI);
 
+            // ========== 文本清洗与修复 ==========
+            function fixPdfMojibake(text) {
+                if (!text) return text;
+                const replacements = {
+                    '\u00E2\u20AC\u2122': '\u2019', // â€™ -> '
+                    '\u00E2\u20AC\u0099': '\u2019',
+                    '\u00E2\u20AC\u0153': '\u201C',
+                    '\u00E2\u20AC\u009C': '\u201C',
+                    '\u00E2\u20AC\u009D': '\u201D',
+                    '\u00E2\u20AC\u0093': '\u2013',
+                    '\u00E2\u20AC\u0094': '\u2014',
+                    '\u00E2\u20AC\u00A6': '\u2026',
+                    '\u00E2\u20AC\u00A2': '\u2022',
+                    '\u00C2\u00A0': '\u00A0',
+                };
+                let fixed = text;
+                for (const [mojibake, correct] of Object.entries(replacements)) {
+                    fixed = fixed.split(mojibake).join(correct);
+                }
+                return fixed;
+            }
+
+            function cleanText(text) {
+                if (!text) return '';
+                let cleaned = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+                cleaned = fixPdfMojibake(cleaned);
+                const charMap = {
+                    '\u2018': "'", '\u2019': "'", '\u02BC': "'",
+                    '\u201C': '"', '\u201D': '"',
+                    '\u2013': '-', '\u2014': '-'
+                };
+                cleaned = cleaned.replace(/[\u2018\u2019\u02BC\u201C\u201D\u2013\u2014]/g, (match) => charMap[match] || match);
+                return cleaned;
+            }
+
             // ========== 转换引擎 ==========
 
-            // ---------- 文本提取 ----------
+            // ----- 文本提取 -----
             async function extractText(file, format) {
                 const arrayBuffer = await file.arrayBuffer();
                 let text = '';
-                
+
                 if (format === 'txt') {
                     text = new TextDecoder('utf-8').decode(arrayBuffer);
-                    // 去除 BOM 头
                     if (text.charCodeAt(0) === 0xFEFF) text = text.substring(1);
-                    
                 } else if (format === 'pdf') {
-                    if (!window.pdfjsLib) throw new Error('PDF.js 库未加载');
                     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
                     let full = '';
                     for (let i = 1; i <= pdf.numPages; i++) {
                         const page = await pdf.getPage(i);
                         const content = await page.getTextContent();
-                        // 提取文本并保留基本换行逻辑
                         let lastY = -1;
                         let pageText = '';
                         content.items.forEach(item => {
@@ -274,24 +327,26 @@
                         full += pageText + '\n\n';
                     }
                     text = full;
-                    
                 } else if (format === 'epub') {
-                    if (!window.ePub) throw new Error('epub.js 库未加载');
                     const book = ePub(arrayBuffer);
                     await book.ready;
                     let full = '';
-                    // 遍历 spine 获取内容
                     const spine = book.spine;
                     for (let i = 0; i < spine.length; i++) {
                         const item = spine[i];
                         if (item && item.href) {
                             try {
-                                // 使用 book.load 加载资源
-                                const doc = await book.load(item.href);
-                                if (doc && doc.body) {
-                                    full += doc.body.textContent + '\n\n';
-                                } else if (doc && doc.textContent) {
-                                    full += doc.textContent + '\n\n';
+                                const section = await book.get(item.href);
+                                if (section) {
+                                    if (section.textContent) {
+                                        full += section.textContent + '\n\n';
+                                    } else if (section.body && section.body.textContent) {
+                                        full += section.body.textContent + '\n\n';
+                                    } else if (typeof section === 'string') {
+                                        const tempDiv = document.createElement('div');
+                                        tempDiv.innerHTML = section;
+                                        full += tempDiv.textContent + '\n\n';
+                                    }
                                 }
                             } catch (e) {
                                 console.warn('跳过章节:', item.href, e);
@@ -299,15 +354,11 @@
                         }
                     }
                     text = full;
-                    
                 } else if (format === 'mobi') {
-                    // MOBI 纯 JS 解析极其复杂，采用稳健的降级提取策略
                     const decoder = new TextDecoder('utf-8');
                     let raw = decoder.decode(arrayBuffer);
-                    // 尝试提取 HTML 内容
                     const htmlMatch = raw.match(/<html[^>]*>([\s\S]*?)<\/html>/i);
                     if (htmlMatch) raw = htmlMatch[1];
-                    // 清理 HTML 标签
                     raw = raw.replace(/<br\s*\/?>/gi, '\n')
                              .replace(/<p[^>]*>/gi, '\n')
                              .replace(/<\/p>/gi, '\n')
@@ -319,20 +370,16 @@
                              .replace(/&quot;/g, '"');
                     text = raw;
                 }
-                
-                // 通用文本清洗
-                text = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').trim();
+
+                text = cleanText(text);
                 return text;
             }
 
-            // ---------- 格式生成 ----------
-            
-            // PDF 生成 (支持中文，采用截图分页方案)
+            // ----- 生成 PDF（已修正分页逻辑）-----
             async function generatePDF(text, title) {
                 const container = document.createElement('div');
                 container.style.cssText = 'position:absolute;left:-9999px;top:0;width:800px;padding:40px;background:white;font-family:system-ui,sans-serif;line-height:1.8;font-size:14px;color:#000;';
-                
-                // 构建内容
+
                 const titleEl = document.createElement('h1');
                 titleEl.textContent = title;
                 titleEl.style.cssText = 'font-size:24px;margin-bottom:20px;text-align:center;';
@@ -352,50 +399,51 @@
                         useCORS: true,
                         backgroundColor: '#ffffff'
                     });
-                    
+
                     const { jsPDF } = window.jspdf;
                     const doc = new jsPDF('p', 'mm', 'a4');
-                    const imgWidth = 210; 
+                    const imgWidth = 210;
                     const pageHeight = 297;
                     const margin = 10;
                     const usableHeight = pageHeight - margin * 2;
-                    
-                    // 计算切片高度
-                    const imgHeight = (canvas.height * imgWidth) / canvas.width;
-                    let heightLeft = imgHeight;
-                    let position = margin;
-                    
-                    let imgData = canvas.toDataURL('image/jpeg', 0.95); // 使用 JPEG 减小体积
-                    doc.addImage(imgData, 'JPEG', 0, position, imgWidth, imgHeight);
-                    heightLeft -= usableHeight;
-                    
-                    while (heightLeft > 0) {
-                        position = margin - (imgHeight - heightLeft);
-                        doc.addPage();
-                        doc.addImage(imgData, 'JPEG', 0, position, imgWidth, imgHeight);
-                        heightLeft -= usableHeight;
+                    const totalHeight = (canvas.height * imgWidth) / canvas.width;
+                    let remaining = totalHeight;
+                    let srcY = 0;
+
+                    while (remaining > 0) {
+                        if (srcY > 0) doc.addPage();
+                        const sliceHeight = Math.min(remaining, usableHeight);
+                        const ratio = sliceHeight / totalHeight;
+                        const canvasSlice = document.createElement('canvas');
+                        canvasSlice.width = canvas.width;
+                        canvasSlice.height = Math.floor(canvas.height * ratio);
+                        const ctx = canvasSlice.getContext('2d');
+                        ctx.drawImage(canvas, 0, srcY, canvas.width, canvas.height * ratio, 0, 0, canvas.width, canvasSlice.height);
+                        const sliceData = canvasSlice.toDataURL('image/jpeg', 0.95);
+                        doc.addImage(sliceData, 'JPEG', 0, margin, imgWidth, sliceHeight);
+                        srcY += canvas.height * ratio;
+                        remaining -= sliceHeight;
                     }
-                    
                     return doc.output('blob');
                 } finally {
                     document.body.removeChild(container);
                 }
             }
 
-            // EPUB 生成
+            // ----- 生成 EPUB -----
             async function generateEPUB(text, title) {
                 const zip = new JSZip();
                 const uuid = 'urn:uuid:' + ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c => (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16));
-                
+
                 const escapeXml = (unsafe) => unsafe.replace(/[<>&'"]/g, (c) => ({
                     '<': '&lt;', '>': '&gt;', '&': '&amp;', '\'': '&apos;', '"': '&quot;'
                 }[c]));
 
                 const safeTitle = escapeXml(title);
-                
+
                 zip.file("mimetype", "application/epub+zip", { compression: "STORE" });
                 zip.file("META-INF/container.xml", `<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`);
-                
+
                 zip.file("OEBPS/content.opf", `<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="BookId">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -411,14 +459,14 @@
     <itemref idref="chapter1"/>
   </spine>
 </package>`);
-                
+
                 zip.file("OEBPS/toc.ncx", `<?xml version="1.0" encoding="UTF-8"?>
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
   <head><meta name="dtb:uid" content="${uuid}"/></head>
   <docTitle><text>${safeTitle}</text></docTitle>
   <navMap><navPoint id="navpoint-1" playOrder="1"><navLabel><text>正文</text></navLabel><content src="chapter1.xhtml"/></navPoint></navMap>
 </ncx>`);
-                
+
                 const paragraphs = text.split('\n').filter(p => p.trim() !== '').map(p => `<p>${escapeXml(p.trim())}</p>`).join('\n');
                 zip.file("OEBPS/chapter1.xhtml", `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
@@ -430,25 +478,24 @@
                 return await zip.generateAsync({ type: "blob", mimeType: "application/epub+zip" });
             }
 
-            // MOBI 生成 (生成兼容 Kindle 邮箱推送的 HTML 结构)
+            // ----- 生成 MOBI（HTML 结构，适配 Kindle 邮箱）-----
             function generateMOBI(text, title) {
                 const escapeHtml = (unsafe) => unsafe.replace(/[<>&'"]/g, (c) => ({
                     '<': '&lt;', '>': '&gt;', '&': '&amp;', '\'': '&apos;', '"': '&quot;'
                 }[c]));
-                
+
                 const paragraphs = text.split('\n').filter(p => p.trim() !== '').map(p => `<p>${escapeHtml(p.trim())}</p>`).join('\n');
                 const htmlContent = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${escapeHtml(title)}</title></head><body><h1>${escapeHtml(title)}</h1>${paragraphs}</body></html>`;
-                
                 return new Blob([htmlContent], { type: "application/x-mobipocket-ebook" });
             }
 
-            // ---------- 主转换流程 ----------
+            // ----- 主转换流程 -----
             async function startConversion() {
                 if (!currentFile || isConverting) return;
 
                 const fromFmt = currentFormat;
                 const toFmt = targetFormat.value;
-                
+
                 if (fromFmt === toFmt) {
                     showStatus('源格式与目标格式相同，无需转换', 'error');
                     return;
@@ -472,7 +519,7 @@
 
                     const baseName = currentFile.name.replace(/\.[^.]+$/, '') || 'converted';
                     let blob;
-                    
+
                     if (toFmt === 'txt') {
                         blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
                     } else if (toFmt === 'pdf') {
@@ -493,7 +540,7 @@
 
                     addHistory(currentFile.name, fromFmt.toUpperCase(), toFmt.toUpperCase(), `${baseName}.${toFmt}`);
                     setProgress(100);
-                    
+
                 } catch (error) {
                     console.error('Conversion Error:', error);
                     showStatus('转换失败：' + error.message, 'error');
@@ -531,7 +578,6 @@
             // ---------- Service Worker 注册 ----------
             if ('serviceWorker' in navigator) {
                 window.addEventListener('load', () => {
-                    // 注意：这里的路径相对于当前页面
                     navigator.serviceWorker.register('./sw.js')
                         .then(reg => console.log('SW registered:', reg.scope))
                         .catch(err => console.warn('SW registration failed:', err));
