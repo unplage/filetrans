@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#3b82f6">
+    <title>文转大师 · 文档转换器</title>
+
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- 核心依赖库 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/epub.js/0.3.93/epub.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mobi-parser@1.0.1/dist/mobi-parser.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        .drag-over { border-color: #3b82f6 !important; background-color: #eff6ff !important; }
+        .spinner { border-top-color: #3b82f6; animation: spin 0.8s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .progress-bar { transition: width 0.3s ease; }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen flex flex-col items-center py-8 px-4">
+
+    <!-- 头部 -->
+    <header class="text-center mb-8 max-w-2xl">
+        <h1 class="text-4xl font-bold text-gray-800 mb-1 flex items-center justify-center gap-2">
+            <span>📄</span> 文转大师
+        </h1>
+        <p class="text-gray-500 text-sm">PDF · EPUB · TXT · MOBI 互转 · 纯本地 · 无上传</p>
+    </header>
+
+    <!-- 主卡片 -->
+    <main class="w-full max-w-2xl bg-white rounded-2xl shadow-lg p-6 md:p-8 space-y-6">
+        <!-- 上传区域 -->
+        <div id="dropZone" class="border-2 border-dashed border-gray-300 rounded-xl p-10 text-center cursor-pointer transition-colors hover:border-blue-400 hover:bg-blue-50">
+            <div class="flex flex-col items-center">
+                <svg class="w-14 h-14 text-gray-400 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                </svg>
+                <p class="text-gray-600 font-medium mb-1">拖拽文件到这里，或点击选择</p>
+                <p class="text-sm text-gray-400">支持 PDF, EPUB, TXT, MOBI</p>
+                <input type="file" id="fileInput" accept=".pdf,.epub,.txt,.mobi" class="hidden">
+            </div>
+        </div>
+
+        <!-- 文件信息 -->
+        <div id="fileInfo" class="hidden bg-blue-50 p-4 rounded-lg text-sm text-blue-700 flex justify-between items-center">
+            <div>
+                <span class="font-semibold">📎</span>
+                <span id="fileName" class="font-medium break-all"></span>
+                <span class="ml-2 text-xs bg-blue-200 px-2 py-0.5 rounded-full" id="fileFormat"></span>
+            </div>
+            <button id="removeFileBtn" class="text-red-500 hover:text-red-700 text-lg font-bold px-2">✕</button>
+        </div>
+
+        <!-- 转换设置 -->
+        <div class="flex flex-col sm:flex-row gap-3 items-end">
+            <div class="flex-1 w-full">
+                <label class="block text-sm font-medium text-gray-700 mb-1">目标格式</label>
+                <select id="targetFormat" class="w-full p-2.5 border border-gray-300 rounded-lg shadow-sm focus:border-blue-500 focus:ring-blue-500 bg-white">
+                    <option value="txt">TXT (纯文本)</option>
+                    <option value="pdf">PDF (文档)</option>
+                    <option value="epub">EPUB (电子书)</option>
+                    <option value="mobi">MOBI (Kindle)</option>
+                </select>
+            </div>
+            <button id="convertBtn" disabled class="w-full sm:w-40 bg-blue-600 text-white py-2.5 px-5 rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2 h-11">
+                <span id="btnText">开始转换</span>
+                <div id="btnSpinner" class="hidden spinner w-5 h-5 border-2 border-white rounded-full"></div>
+            </button>
+        </div>
+
+        <!-- 进度条 & 状态 -->
+        <div id="progressArea" class="hidden space-y-1">
+            <div class="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+                <div id="progressBar" class="progress-bar bg-blue-600 h-full rounded-full" style="width:0%"></div>
+            </div>
+            <p id="statusText" class="text-sm text-gray-600 text-center">就绪</p>
+        </div>
+
+        <!-- 结果区 -->
+        <div id="resultSection" class="hidden bg-green-50 p-4 rounded-lg flex flex-wrap items-center justify-between gap-3">
+            <span class="text-sm text-green-700 font-medium">✅ 转换完成！</span>
+            <div class="flex gap-2">
+                <a id="downloadLink" class="bg-green-600 text-white py-2 px-4 rounded-lg hover:bg-green-700 transition-colors text-sm flex items-center gap-1">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                    下载文件
+                </a>
+                <button id="resetBtn" class="text-sm text-gray-500 hover:text-gray-700 px-3 py-2 rounded-lg border border-gray-300 hover:bg-gray-50 transition-colors">重置</button>
+            </div>
+        </div>
+
+        <!-- 历史记录 -->
+        <div id="historyArea" class="hidden border-t border-gray-200 pt-4 mt-2">
+            <h3 class="text-sm font-semibold text-gray-600 mb-2">📋 转换历史</h3>
+            <div id="historyList" class="max-h-40 overflow-y-auto space-y-1"></div>
+        </div>
+    </main>
+
+    <footer class="mt-6 text-center text-xs text-gray-400 max-w-2xl">
+        <p>所有处理均在浏览器本地完成，文件不上传任何服务器。</p>
+        <p class="mt-1">© 2026 文转大师 · 纯前端 PWA</p>
+    </footer>
+
+    <script>
+        // ============ 初始化 ============
+        (function() {
+            'use strict';
+
+            // ----- DOM 引用 -----
+            const dropZone = document.getElementById('dropZone');
+            const fileInput = document.getElementById('fileInput');
+            const fileInfo = document.getElementById('fileInfo');
+            const fileName = document.getElementById('fileName');
+            const fileFormat = document.getElementById('fileFormat');
+            const removeFileBtn = document.getElementById('removeFileBtn');
+            const targetFormat = document.getElementById('targetFormat');
+            const convertBtn = document.getElementById('convertBtn');
+            const btnText = document.getElementById('btnText');
+            const btnSpinner = document.getElementById('btnSpinner');
+            const progressArea = document.getElementById('progressArea');
+            const progressBar = document.getElementById('progressBar');
+            const statusText = document.getElementById('statusText');
+            const resultSection = document.getElementById('resultSection');
+            const downloadLink = document.getElementById('downloadLink');
+            const resetBtn = document.getElementById('resetBtn');
+            const historyArea = document.getElementById('historyArea');
+            const historyList = document.getElementById('historyList');
+
+            // ----- 状态 -----
+            let currentFile = null;                // File 对象
+            let currentFormat = '';               // 检测到的格式 (扩展名)
+            let isConverting = false;
+            let lastDownloadUrl = null;            // 用于释放 object URL
+
+            // ----- 辅助函数 -----
+            function showStatus(msg, type = 'info') {
+                statusText.textContent = msg;
+                progressArea.classList.remove('hidden');
+                if (type === 'error') statusText.className = 'text-sm text-red-600 text-center';
+                else if (type === 'success') statusText.className = 'text-sm text-green-600 text-center';
+                else statusText.className = 'text-sm text-gray-600 text-center';
+            }
+
+            function setProgress(pct) {
+                progressBar.style.width = Math.min(100, pct) + '%';
+            }
+
+            function resetProgress() {
+                progressArea.classList.add('hidden');
+                setProgress(0);
+                statusText.textContent = '';
+            }
+
+            function toggleLoading(loading) {
+                isConverting = loading;
+                convertBtn.disabled = loading;
+                btnText.textContent = loading ? '转换中...' : '开始转换';
+                btnSpinner.classList.toggle('hidden', !loading);
+            }
+
+            function resetUI() {
+                if (lastDownloadUrl) {
+                    URL.revokeObjectURL(lastDownloadUrl);
+                    lastDownloadUrl = null;
+                }
+                currentFile = null;
+                currentFormat = '';
+                fileInput.value = '';
+                fileInfo.classList.add('hidden');
+                resultSection.classList.add('hidden');
+                resetProgress();
+                convertBtn.disabled = true;
+                btnText.textContent = '开始转换';
+                // 清理历史记录显示（但保留已存记录）
+            }
+
+            function addHistory(srcName, fromFmt, toFmt, outName) {
+                const item = document.createElement('div');
+                item.className = 'flex justify-between text-xs text-gray-600 border-b border-gray-100 py-1.5';
+                const now = new Date().toLocaleTimeString();
+                item.innerHTML = `
+                    <span class="truncate max-w-xs">${srcName} → ${outName}</span>
+                    <span><span class="bg-gray-200 px-2 py-0.5 rounded-full">${fromFmt}→${toFmt}</span> ${now}</span>
+                `;
+                historyList.prepend(item);
+                historyArea.classList.remove('hidden');
+                // 限制条数
+                while (historyList.children.length > 20) {
+                    historyList.removeChild(historyList.lastChild);
+                }
+            }
+
+            // ----- 文件处理 -----
+            function handleFile(file) {
+                if (!file) return;
+                const ext = file.name.split('.').pop().toLowerCase();
+                if (!['pdf', 'epub', 'txt', 'mobi'].includes(ext)) {
+                    alert('仅支持 PDF, EPUB, TXT, MOBI 格式');
+                    return;
+                }
+                currentFile = file;
+                currentFormat = ext;
+                fileName.textContent = file.name;
+                fileFormat.textContent = ext.toUpperCase();
+                fileInfo.classList.remove('hidden');
+                convertBtn.disabled = false;
+                resultSection.classList.add('hidden');
+                resetProgress();
+                showStatus(`已加载：${file.name}，可转换为其他格式`, 'info');
+            }
+
+            // 事件绑定
+            dropZone.addEventListener('click', () => fileInput.click());
+            fileInput.addEventListener('change', (e) => {
+                if (e.target.files.length) handleFile(e.target.files[0]);
+            });
+            dropZone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                dropZone.classList.add('drag-over');
+            });
+            dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+            dropZone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                dropZone.classList.remove('drag-over');
+                if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+            });
+            removeFileBtn.addEventListener('click', resetUI);
+            resetBtn.addEventListener('click', resetUI);
+
+            // ----- 转换引擎 -----
+
+            // ---------- 文本提取 ----------
+            async function extractText(file, format) {
+                const arrayBuffer = await file.arrayBuffer();
+                let text = '';
+                if (format === 'txt') {
+                    text = new TextDecoder('utf-8').decode(arrayBuffer);
+                } else if (format === 'pdf') {
+                    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                    let full = '';
+                    for (let i = 1; i <= pdf.numPages; i++) {
+                        const page = await pdf.getPage(i);
+                        const content = await page.getTextContent();
+                        full += content.items.map(item => item.str).join(' ') + '\n\n';
+                    }
+                    text = full;
+                } else if (format === 'epub') {
+                    // 使用 epub.js 正确提取
+                    const book = ePub(arrayBuffer);
+                    await book.ready;
+                    const spine = book.spine;
+                    let full = '';
+                    for (const item of spine) {
+                        try {
+                            const section = await book.get(item.href);
+                            if (section && section.textContent) {
+                                full += section.textContent + '\n\n';
+                            }
+                        } catch (_) { /* 跳过单个章节错误 */ }
+                    }
+                    text = full;
+                } else if (format === 'mobi') {
+                    // 使用 mobi-parser
+                    const parser = new MobiParser(arrayBuffer);
+                    const meta = parser.parse();
+                    text = meta.rawml || meta.rawtext || '';
+                }
+                return text;
+            }
+
+            // ---------- 格式生成 ----------
+            async function generateFile(text, format, baseName) {
+                let blob;
+                let ext = format;
+
+                if (format === 'txt') {
+                    blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+                } 
+                else if (format === 'pdf') {
+                    blob = await generatePDF(text, baseName);
+                } 
+                else if (format === 'epub') {
+                    blob = await generateEPUB(text, baseName);
+                } 
+                else if (format === 'mobi') {
+                    blob = generateMOBI(text, baseName);
+                }
+                return { blob, ext };
+            }
+
+            // ----- PDF 生成（支持中文）-----
+            async function generatePDF(text, title) {
+                // 使用 html2canvas 将文本渲染为图片再生成 PDF
+                const container = document.createElement('div');
+                container.style.cssText = 'position:absolute;left:-9999px;top:0;width:800px;padding:40px;background:white;font-family:system-ui,sans-serif;line-height:1.8;';
+                container.innerHTML = `<h1 style="font-size:28px;margin-bottom:20px;">${title.replace(/</g,'&lt;')}</h1><div style="white-space:pre-wrap;word-wrap:break-word;">${text.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>`;
+                document.body.appendChild(container);
+
+                try {
+                    const canvas = await html2canvas(container, {
+                        scale: 2,
+                        useCORS: true,
+                        logging: false,
+                        backgroundColor: '#ffffff'
+                    });
+                    const imgData = canvas.toDataURL('image/png');
+                    const { jsPDF } = window.jspdf;
+                    const doc = new jsPDF('p', 'mm', 'a4');
+                    const imgWidth = 210; // A4 width in mm
+                    const imgHeight = (canvas.height * imgWidth) / canvas.width;
+                    let remainingHeight = imgHeight;
+                    let sourceY = 0;
+                    const pageHeight = 297;
+                    const margin = 10;
+                    const usableHeight = pageHeight - margin * 2;
+
+                    while (remainingHeight > 0) {
+                        if (sourceY > 0) doc.addPage();
+                        const sectionHeight = Math.min(remainingHeight, usableHeight);
+                        const ratio = sectionHeight / imgHeight;
+                        const canvasSection = document.createElement('canvas');
+                        canvasSection.width = canvas.width;
+                        canvasSection.height = Math.floor(canvas.height * ratio);
+                        const ctx = canvasSection.getContext('2d');
+                        ctx.drawImage(canvas, 0, sourceY, canvas.width, canvas.height * ratio, 0, 0, canvas.width, canvasSection.height);
+                        const sectionData = canvasSection.toDataURL('image/png');
+                        doc.addImage(sectionData, 'PNG', 0, 0, imgWidth, sectionHeight);
+                        sourceY += canvas.height * ratio;
+                        remainingHeight -= sectionHeight;
+                    }
+                    return doc.output('blob');
+                } finally {
+                    document.body.removeChild(container);
+                }
+            }
+
+            // ----- EPUB 生成 -----
+            async function generateEPUB(text, title) {
+                const zip = new JSZip();
+                const uuid = 'urn:uuid:' + ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c => (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16));
+                const escapedTitle = title.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                const escapedText = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+                // mimetype
+                zip.file("mimetype", "application/epub+zip", { compression: "STORE" });
+                // container.xml
+                zip.file("META-INF/container.xml", `<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`);
+                // content.opf
+                const opf = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="BookId">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>${escapedTitle}</dc:title>
+    <dc:language>zh-CN</dc:language>
+    <dc:identifier id="BookId">${uuid}</dc:identifier>
+  </metadata>
+  <manifest>
+    <item id="chapter1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+  </manifest>
+  <spine toc="ncx">
+    <itemref idref="chapter1"/>
+  </spine>
+</package>`;
+                zip.file("OEBPS/content.opf", opf);
+                // toc.ncx
+                zip.file("OEBPS/toc.ncx", `<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head><meta name="dtb:uid" content="${uuid}"/></head>
+  <docTitle><text>${escapedTitle}</text></docTitle>
+  <navMap><navPoint id="navpoint-1" playOrder="1"><navLabel><text>正文</text></navLabel><content src="chapter1.xhtml"/></navPoint></navMap>
+</ncx>`);
+                // 内容章节
+                const paragraphs = escapedText.split('\n').filter(p => p.trim() !== '').map(p => `<p>${p.trim()}</p>`).join('\n');
+                const xhtml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>${escapedTitle}</title><style>body{font-family:sans-serif;line-height:1.6;margin:2em;}p{margin:1em 0;}</style></head>
+<body><h1>${escapedTitle}</h1>${paragraphs}</body>
+</html>`;
+                zip.file("OEBPS/chapter1.xhtml", xhtml);
+
+                return await zip.generateAsync({ type: "blob", mimeType: "application/epub+zip" });
+            }
+
+            // ----- MOBI 生成（真实 PalmDOC）-----
+            function generateMOBI(text, title) {
+                // 简化 PalmDOC（未压缩） + PDB 包装
+                const encoder = new TextEncoder();
+                const textBytes = encoder.encode(text);
+                // PalmDOC 头部 (78 bytes)
+                const header = new Uint8Array(78);
+                header[0] = 1; // compression: none
+                const len = textBytes.length;
+                header[4] = (len >> 24) & 0xFF;
+                header[5] = (len >> 16) & 0xFF;
+                header[6] = (len >> 8) & 0xFF;
+                header[7] = len & 0xFF;
+                header[8] = 0; header[9] = 1; // 1 record
+                header[10] = 0x10; header[11] = 0x00;
+                const docData = new Uint8Array(header.length + textBytes.length);
+                docData.set(header, 0);
+                docData.set(textBytes, header.length);
+
+                // PDB 头部 (78 bytes)
+                const pdb = new Uint8Array(78);
+                const name = (title || 'book').padEnd(32, ' ');
+                for (let i=0; i<32; i++) pdb[i] = name.charCodeAt(i);
+                pdb[36] = 0x4D; pdb[37] = 0x4F; pdb[38] = 0x42; pdb[39] = 0x49; // 'MOBI'
+                pdb[40] = 0x4D; pdb[41] = 0x4F; pdb[42] = 0x42; pdb[43] = 0x49;
+                pdb[48] = 0; pdb[49] = 1; // record count
+
+                const recordList = new Uint8Array(8);
+                recordList[0] = 0; recordList[1] = 0; recordList[2] = 0; recordList[3] = 0x4E;
+                const total = docData.length;
+                recordList[4] = (total >> 24) & 0xFF;
+                recordList[5] = (total >> 16) & 0xFF;
+                recordList[6] = (total >> 8) & 0xFF;
+                recordList[7] = total & 0xFF;
+
+                const final = new Uint8Array(78 + 8 + docData.length);
+                final.set(pdb, 0);
+                final.set(recordList, 78);
+                final.set(docData, 86);
+                return new Blob([final], { type: 'application/x-mobipocket-ebook' });
+            }
+
+            // ---------- 主转换流程 ----------
+            async function startConversion() {
+                if (!currentFile || isConverting) return;
+
+                const fromFmt = currentFormat;
+                const toFmt = targetFormat.value;
+                if (fromFmt === toFmt) {
+                    alert('源格式与目标格式相同，无需转换');
+                    return;
+                }
+
+                toggleLoading(true);
+                resultSection.classList.add('hidden');
+                progressArea.classList.remove('hidden');
+                setProgress(10);
+                showStatus('正在提取文本...', 'info');
+
+                try {
+                    // 1. 提取纯文本
+                    const text = await extractText(currentFile, fromFmt);
+                    if (!text.trim()) throw new Error('未能提取到任何文字内容');
+
+                    setProgress(50);
+                    showStatus('正在生成目标文件...', 'info');
+
+                    // 2. 生成目标格式
+                    const baseName = currentFile.name.replace(/\.[^.]+$/, '') || 'converted';
+                    const { blob, ext } = await generateFile(text, toFmt, baseName);
+
+                    setProgress(90);
+                    showStatus('转换完成，准备下载...', 'success');
+
+                    // 3. 下载
+                    if (lastDownloadUrl) URL.revokeObjectURL(lastDownloadUrl);
+                    const url = URL.createObjectURL(blob);
+                    lastDownloadUrl = url;
+                    downloadLink.href = url;
+                    downloadLink.download = `${baseName}.${ext}`;
+                    resultSection.classList.remove('hidden');
+
+                    // 记录历史
+                    addHistory(currentFile.name, fromFmt.toUpperCase(), toFmt.toUpperCase(), `${baseName}.${ext}`);
+
+                    setProgress(100);
+                } catch (error) {
+                    console.error(error);
+                    showStatus('转换失败：' + error.message, 'error');
+                    setProgress(0);
+                } finally {
+                    toggleLoading(false);
+                }
+            }
+
+            convertBtn.addEventListener('click', startConversion);
+
+            // ---------- PWA 动态 manifest (无需外部文件) ----------
+            function initPWA() {
+                const manifest = {
+                    name: "文转大师 - 文档转换器",
+                    short_name: "文转大师",
+                    start_url: ".",
+                    display: "standalone",
+                    background_color: "#ffffff",
+                    theme_color: "#3b82f6",
+                    icons: [{
+                        src: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📄</text></svg>",
+                        sizes: "192x192",
+                        type: "image/svg+xml"
+                    }]
+                };
+                const blob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
+                const link = document.createElement('link');
+                link.rel = 'manifest';
+                link.href = URL.createObjectURL(blob);
+                document.head.appendChild(link);
+            }
+            initPWA();
+
+            // ---------- Service Worker（需外部 sw.js，只注册不报错） ----------
+            if ('serviceWorker' in navigator) {
+                navigator.serviceWorker.register('/sw.js')
+                    .then(() => console.log('SW registered'))
+                    .catch(() => console.log('SW not available (may need sw.js file)'));
+            }
+
+            // ---------- 初始化状态 ----------
+            resetUI();
+            showStatus('就绪，请上传文件', 'info');
+        })();
+    </script>
+</body>
+  </html>
