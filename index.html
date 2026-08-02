@@ -9,7 +9,7 @@
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com/"></script>
 
-    <!-- 核心依赖库（使用高可用 CDN） -->
+    <!-- 核心依赖库 -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
@@ -264,11 +264,11 @@
             removeFileBtn.addEventListener('click', resetUI);
             resetBtn.addEventListener('click', resetUI);
 
-            // ========== 文本清洗与修复 ==========
+            // ========== 文本清洗 ==========
             function fixPdfMojibake(text) {
                 if (!text) return text;
                 const replacements = {
-                    '\u00E2\u20AC\u2122': '\u2019', // â€™ -> '
+                    '\u00E2\u20AC\u2122': '\u2019',
                     '\u00E2\u20AC\u0099': '\u2019',
                     '\u00E2\u20AC\u0153': '\u201C',
                     '\u00E2\u20AC\u009C': '\u201C',
@@ -301,7 +301,7 @@
 
             // ========== 转换引擎 ==========
 
-            // ----- 文本提取 -----
+            // ----- 文本提取（PDF 分支已优化段落合并）-----
             async function extractText(file, format) {
                 const arrayBuffer = await file.arrayBuffer();
                 let text = '';
@@ -315,16 +315,28 @@
                     for (let i = 1; i <= pdf.numPages; i++) {
                         const page = await pdf.getPage(i);
                         const content = await page.getTextContent();
-                        let lastY = -1;
+                        // 排序：从上到下（Y 降序），从左到右（X 升序）
+                        const items = content.items.sort((a, b) => b.transform[5] - a.transform[5] || a.transform[4] - b.transform[4]);
                         let pageText = '';
-                        content.items.forEach(item => {
-                            if (lastY !== -1 && Math.abs(item.transform[5] - lastY) > 5) {
-                                pageText += '\n';
+                        let lastY = -999;
+                        let lineBuffer = [];
+                        const lineThreshold = 10; // Y 坐标差异小于此值视为同一行
+
+                        for (const item of items) {
+                            const y = item.transform[5];
+                            if (lastY !== -999 && Math.abs(y - lastY) > lineThreshold) {
+                                // 新段落：将当前行缓冲区的文本拼接并换行
+                                pageText += lineBuffer.join(' ') + '\n';
+                                lineBuffer = [];
                             }
-                            pageText += item.str + ' ';
-                            lastY = item.transform[5];
-                        });
-                        full += pageText + '\n\n';
+                            lineBuffer.push(item.str);
+                            lastY = y;
+                        }
+                        // 处理最后一行
+                        if (lineBuffer.length) {
+                            pageText += lineBuffer.join(' ') + '\n';
+                        }
+                        full += pageText + '\n';
                     }
                     text = full;
                 } else if (format === 'epub') {
@@ -375,7 +387,7 @@
                 return text;
             }
 
-            // ----- 生成 PDF（已修正分页逻辑）-----
+            // ----- 生成 PDF（已修正分页）-----
             async function generatePDF(text, title) {
                 const container = document.createElement('div');
                 container.style.cssText = 'position:absolute;left:-9999px;top:0;width:800px;padding:40px;background:white;font-family:system-ui,sans-serif;line-height:1.8;font-size:14px;color:#000;';
@@ -478,7 +490,7 @@
                 return await zip.generateAsync({ type: "blob", mimeType: "application/epub+zip" });
             }
 
-            // ----- 生成 MOBI（HTML 结构，适配 Kindle 邮箱）-----
+            // ----- 生成 MOBI -----
             function generateMOBI(text, title) {
                 const escapeHtml = (unsafe) => unsafe.replace(/[<>&'"]/g, (c) => ({
                     '<': '&lt;', '>': '&gt;', '&': '&amp;', '\'': '&apos;', '"': '&quot;'
