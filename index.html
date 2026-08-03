@@ -214,10 +214,21 @@
                 const item = document.createElement('div');
                 item.className = 'flex justify-between text-xs text-gray-600 border-b border-gray-100 py-1.5';
                 const now = new Date().toLocaleTimeString();
-                item.innerHTML = `
-                    <span class="truncate max-w-xs">${srcName} → ${outName}</span>
-                    <span class="ml-2 flex-shrink-0"><span class="bg-gray-200 px-2 py-0.5 rounded-full">${fromFmt}→${toFmt}</span> ${now}</span>
-                `;
+
+                const left = document.createElement('span');
+                left.className = 'truncate max-w-xs';
+                left.textContent = `${srcName} → ${outName}`;
+
+                const right = document.createElement('span');
+                right.className = 'ml-2 flex-shrink-0';
+                const badge = document.createElement('span');
+                badge.className = 'bg-gray-200 px-2 py-0.5 rounded-full';
+                badge.textContent = `${fromFmt}→${toFmt}`;
+                right.appendChild(badge);
+                right.appendChild(document.createTextNode(' ' + now));
+
+                item.appendChild(left);
+                item.appendChild(right);
                 historyList.prepend(item);
                 historyArea.classList.remove('hidden');
                 while (historyList.children.length > 20) {
@@ -243,7 +254,8 @@
                 resultSection.classList.add('hidden');
                 progressArea.classList.remove('hidden');
                 setProgress(0);
-                showStatus(`已加载：${file.name}`, 'info');
+                const sizeWarn = file.size > 50 * 1024 * 1024 ? ' 注意：文件超过 50MB，受浏览器内存限制，转换可能失败。' : '';
+                showStatus(`已加载：${file.name}${sizeWarn}`, 'info');
             }
 
             // 事件绑定
@@ -288,195 +300,624 @@
 
             function cleanText(text) {
                 if (!text) return '';
-                let cleaned = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+                // 统一换行符：\r\n / \r -> \n
+                let cleaned = text.replace(/\r\n?/g, '\n');
+                // 移除控制字符（保留 \n 和 \t）
+                cleaned = cleaned.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+                // 修复 PDF 常见 mojibake
                 cleaned = fixPdfMojibake(cleaned);
-                const charMap = {
-                    '\u2018': "'", '\u2019': "'", '\u02BC': "'",
-                    '\u201C': '"', '\u201D': '"',
-                    '\u2013': '-', '\u2014': '-'
-                };
-                cleaned = cleaned.replace(/[\u2018\u2019\u02BC\u201C\u201D\u2013\u2014]/g, (match) => charMap[match] || match);
+                // 不换行空格 -> 普通空格
+                cleaned = cleaned.replace(/\u00A0/g, ' ');
+                // 保留原文的智能引号/破折号等 Unicode 字符，不做 ASCII 归一化
                 return cleaned;
             }
 
             // ========== 转换引擎 ==========
 
-            // ----- 文本提取（PDF 分支采用智能段落合并）-----
+            // ----- 编码检测（TXT / HTML 输入）-----
+            function normalizeEncodingName(name) {
+                const n = String(name).toLowerCase().replace(/[\s_]/g, '-');
+                const map = {
+                    'utf8': 'utf-8', 'utf-8': 'utf-8', 'unicode': 'utf-16le',
+                    'utf16': 'utf-16le', 'utf-16': 'utf-16le', 'utf-16le': 'utf-16le', 'utf-16be': 'utf-16be',
+                    'gbk': 'gb18030', 'gb2312': 'gb18030', 'gb18030': 'gb18030', 'cp936': 'gb18030',
+                    'big5': 'big5', 'big5-hkscs': 'big5',
+                    'latin1': 'latin1', 'latin-1': 'latin1', 'iso-8859-1': 'latin1', 'iso8859-1': 'latin1',
+                    'iso-8859-15': 'latin1', 'cp1252': 'windows-1252', 'windows-1252': 'windows-1252',
+                    'windows1252': 'windows-1252', '1252': 'windows-1252',
+                    'us-ascii': 'utf-8', 'ascii': 'utf-8', 'shift-jis': 'shift_jis', 'shiftjis': 'shift_jis',
+                    'sjis': 'shift_jis', 'euc-jp': 'euc-jp', 'euc-kr': 'euc-kr', 'cp949': 'euc-kr',
+                    'ks_c_5601-1987': 'euc-kr'
+                };
+                return map[n] || n;
+            }
+
+            function hasBom(bytes) {
+                if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) return 'utf-8';
+                if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) return 'utf-16le';
+                if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) return 'utf-16be';
+                return null;
+            }
+
+            // 通用文本解码：BOM -> UTF-8(严格) -> GB18030 -> Big5 -> Latin-1 兜底，绝不静默输出乱码
+            function decodeBytes(bytes) {
+                const bom = hasBom(bytes);
+                if (bom === 'utf-8') return new TextDecoder('utf-8').decode(bytes.subarray(3));
+                if (bom === 'utf-16le') return new TextDecoder('utf-16le').decode(bytes.subarray(2));
+                if (bom === 'utf-16be') return new TextDecoder('utf-16be').decode(bytes.subarray(2));
+                const attempts = [
+                    { enc: 'utf-8' },
+                    { enc: 'gb18030' },
+                    { enc: 'big5' }
+                ];
+                for (const a of attempts) {
+                    try {
+                        return new TextDecoder(a.enc, { fatal: true }).decode(bytes);
+                    } catch (e) { /* try next */ }
+                }
+                return new TextDecoder('latin1').decode(bytes);
+            }
+
+            // HTML 输入：优先识别 <meta charset> / XML 声明 / BOM
+            function detectHtmlCharset(bytes) {
+                const head = new TextDecoder('latin1').decode(bytes.subarray(0, Math.min(bytes.length, 4096)));
+                let m = head.match(/<meta[^>]+charset\s*=\s*["']?\s*([a-zA-Z0-9._-]+)/i);
+                if (m) return m[1];
+                m = head.match(/<\?xml[^>]+encoding\s*=\s*["']([a-zA-Z0-9._-]+)/i);
+                if (m) return m[1];
+                return hasBom(bytes);
+            }
+
+            function decodeHtmlBytes(bytes) {
+                const enc = detectHtmlCharset(bytes);
+                if (enc) {
+                    try { return new TextDecoder(normalizeEncodingName(enc)).decode(bytes); } catch (e) { /* fallthrough */ }
+                }
+                return decodeBytes(bytes);
+            }
+
+            // ----- HTML 转纯文本（块级换行，保留段落/标题结构）-----
+            const BLOCK_TAGS = new Set(['p','div','h1','h2','h3','h4','h5','h6','li','blockquote','pre','tr','td','th','section','article','aside','figure','figcaption','header','footer','address','ul','ol','table','dl','dt','dd','main','nav','summary','details']);
+            const SKIP_TAGS = new Set(['script','style','noscript','template','head','title','meta','link','base']);
+
+            function normalizeHtmlDoc(input) {
+                if (typeof input !== 'string') return input;
+                const parser = new DOMParser();
+                let doc;
+                try {
+                    doc = parser.parseFromString(input, 'application/xhtml+xml');
+                    if (doc.getElementsByTagName('parsererror').length) doc = parser.parseFromString(input, 'text/html');
+                } catch (e) {
+                    doc = parser.parseFromString(input, 'text/html');
+                }
+                return doc;
+            }
+
+            function htmlToText(input) {
+                const doc = normalizeHtmlDoc(input);
+                const root = doc.body || doc.documentElement || doc;
+                const blocks = [];
+                let pending = [];
+                const flush = () => {
+                    if (pending.length) {
+                        const t = pending.join('').trim();
+                        if (t) blocks.push(t);
+                        pending = [];
+                    }
+                };
+                const childrenOf = (node) => Array.prototype.slice.call(node.childNodes || []);
+                function collect(node) {
+                    if (node.nodeType === Node.TEXT_NODE) { pending.push(node.textContent); return; }
+                    if (node.nodeType !== Node.ELEMENT_NODE) return;
+                    const tag = node.nodeName.toLowerCase();
+                    if (SKIP_TAGS.has(tag)) return;
+                    if (tag === 'br') { pending.push('\n'); return; }
+                    if (tag === 'hr') { flush(); blocks.push(''); return; }
+                    // 进入嵌套块前先截断当前块，保证相邻块互不粘连
+                    if (BLOCK_TAGS.has(tag)) flush();
+                    for (const child of childrenOf(node)) collect(child);
+                    if (BLOCK_TAGS.has(tag)) flush();
+                }
+                for (const child of childrenOf(root)) collect(child);
+                flush();
+                let text = blocks.join('\n\n');
+                text = text.replace(/\n{3,}/g, '\n\n');
+                text = text.replace(/[ \t]+$/gm, '');
+                return text;
+            }
+
+            // ----- CJK 智能拼接（PDF 行内文本项）-----
+            function isCjkChar(ch) {
+                return /[\u2E80-\u2EFF\u3000-\u303F\u3040-\u30FF\u3100-\u312F\u3200-\u32FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA48F\uA490-\uA4CF\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFFEF]/.test(ch);
+            }
+            function joinLineItems(items) {
+                let out = '';
+                // 撇号（缩略/所有格，如 "New Yorker" + "’" + "s"）与左引号两侧不加空格；
+                // 右引号/逗号等词尾标点后仍要加空格，避免 “Game,”Broken 粘连
+                const isApostrophe = (c) => /['\u2019\u02BC]/.test(c);
+                const isOpenQuote = (c) => /['\u2018\u201C]/.test(c);
+                for (const s of items) {
+                    if (!s) continue;
+                    if (out.length > 0) {
+                        const a = out.charAt(out.length - 1);
+                        const b = s.charAt(0);
+                        const aSpace = /\s/.test(a);
+                        const bSpace = /\s/.test(b);
+                        if (aSpace || bSpace) {
+                            // 边界已有空白，不额外加空格
+                        } else if (isCjkChar(a) || isCjkChar(b)) {
+                            // 涉及 CJK 字符时不加空格，避免“你好”变“你 好”
+                        } else if (isApostrophe(a) || isApostrophe(b) || isOpenQuote(b)) {
+                            // 撇号/左引号两侧不加空格
+                        } else {
+                            // 其余情况（含右引号、逗号、句号、字母/数字边界）插入空格
+                            out += ' ';
+                        }
+                    }
+                    out += s;
+                }
+                return out;
+            }
+
+            // 每段输出为一行：段落（\n\n 分隔）内所有行合并为一行，段间保留空行
+            // 复用 joinLineItems 的空格规则（英文加空格、中文不加、撇号引号贴合）
+            function flattenToParaLines(text) {
+                if (!text) return '';
+                return text.split(/\n{2,}/)
+                    .map(para => joinLineItems(para.split('\n').map(l => l.trim())))
+                    .filter(Boolean)
+                    .join('\n\n');
+            }
+
+            // PDF 分栏检测：按行分组的栏间隙聚类
+            // 每行独立找相邻文本项之间的"栏间隙"，再跨行聚类取位置一致、支持率高的边界
+            // 兼容紧凑双栏（~18px）、栏行错位、标题页与正文双栏共存（标题行无间隙不影响正文行）
+            // items 需含 x / y / width 字段；domH 为页面主导字高（缩放无关）
+            // 返回栏边界 x 位置（0-2 个），空数组表示单栏
+            function detectPdfColumns(items, domH) {
+                if (items.length === 0) return [];
+
+                // 1) 按 y 聚成视觉行（容差 0.5 倍字高）
+                const rows = [];
+                for (const it of items.slice().sort((a, b) => a.y - b.y)) {
+                    let placed = false;
+                    for (const r of rows) {
+                        if (Math.abs(r.y - it.y) < Math.max(1, domH * 0.5)) { r.items.push(it); placed = true; break; }
+                    }
+                    if (!placed) rows.push({ y: it.y, items: [it] });
+                }
+
+                // 2) 每行内找相邻项之间的栏间隙候选（排除词间小空隙与全宽跨页空隙）
+                const gapCands = [];
+                for (const r of rows) {
+                    const s = r.items.sort((a, b) => a.x - b.x);
+                    for (let k = 1; k < s.length; k++) {
+                        const pr = s[k - 1].x + s[k - 1].width;
+                        const nx = s[k].x;
+                        const g = nx - pr;
+                        if (g >= Math.max(domH * 0.8, 4) && g <= Math.max(domH * 8, 80)) {
+                            gapCands.push((pr + nx) / 2);
+                        }
+                    }
+                }
+
+                // 3) 聚类位置（容差 1.5 倍字高），按支持行数降序
+                const sortedC = gapCands.slice().sort((a, b) => a - b);
+                const clusters = [];
+                for (const c of sortedC) {
+                    const last = clusters[clusters.length - 1];
+                    const lastPos = last ? last.sum / last.n : null;
+                    if (last && c - lastPos <= domH * 1.5) { last.sum += c; last.n++; }
+                    else clusters.push({ sum: c, n: 1 });
+                }
+                clusters.forEach(cl => { cl.pos = cl.sum / cl.n; });
+
+                // 4) 支持率阈值：至少 4 行或 25% 行；返回升序栏边界（最多 2 个，需彼此间隔 > 8 倍字高）
+                const minSupport = Math.max(4, Math.floor(rows.length * 0.25));
+                const breaks = clusters
+                    .filter(cl => cl.n >= minSupport)
+                    .map(cl => cl.pos)
+                    .sort((a, b) => a - b);
+                const result = [];
+                for (const b of breaks) {
+                    if (result.length && Math.abs(b - result[result.length - 1]) < domH * 8) continue;
+                    result.push(b);
+                    if (result.length >= 2) break;
+                }
+                return result;
+            }
+
+            // ----- MOBI 原生二进制解析（PalmDB + PalmDoc LZ77 + MOBI 头 + EXTH）-----
+            function readU16(b, o) { return (b[o] << 8) | b[o + 1]; }
+            function readU32(b, o) { return ((b[o] << 24) >>> 0) + (b[o + 1] << 16) + (b[o + 2] << 8) + b[o + 3]; }
+
+            // MOBI PalmDoc LZ77 解压（与 Calibre / KindleUnpack 一致的 MOBI 变体）：
+            //  0x00, 0x09-0x7F      -> 单字节字面量
+            //  0x01-0x08            -> 后跟 N 个字面量字节
+            //  0x80-0xBF            -> 2 字节回溯码（距离 11 位，长度 3-10）
+            //  0xC0-0xFF            -> "空格" + (c ^ 0x80)
+            function palmdocDecode(data) {
+                const out = [];
+                let i = 0;
+                const n = data.length;
+                while (i < n) {
+                    const c = data[i]; i++;
+                    if (c >= 0x01 && c <= 0x08) {
+                        for (let k = 0; k < c && i < n; k++) { out.push(data[i]); i++; }
+                    } else if (c < 0x80) {
+                        out.push(c);
+                    } else if (c >= 0xC0) {
+                        out.push(0x20);
+                        out.push(c ^ 0x80);
+                    } else {
+                        if (i >= n) break;
+                        const code = (c << 8) | data[i]; i++;
+                        const dist = (code >> 3) & 0x07FF;
+                        const len = (code & 0x07) + 3;
+                        const src = out.length - dist;
+                        if (src < 0) break;
+                        if (dist >= len) {
+                            // 非重叠：一次复制固定区间（不能随输出增长重新计算源位置）
+                            for (let k = 0; k < len; k++) out.push(out[src + k]);
+                        } else {
+                            // 重叠：边复制边增长输出
+                            for (let k = 0; k < len; k++) out.push(out[out.length - dist]);
+                        }
+                    }
+                }
+                return new Uint8Array(out);
+            }
+
+            function detectMobiType(bytes) {
+                if (bytes.length < 8) return 'unknown';
+                const latin1 = new TextDecoder('latin1');
+                // PalmDB 魔数不在文件头：offset 60 = 类型（BOOK/TEXt/REAd），offset 64 = 创建者（MOBI）
+                if (bytes.length >= 68) {
+                    const type = latin1.decode(bytes.subarray(60, 64));
+                    const creator = latin1.decode(bytes.subarray(64, 68));
+                    if (creator === 'MOBI' || ['TEXt', 'REAd', 'BOOK'].includes(type)) return 'palmdb';
+                }
+                const head = latin1.decode(bytes.subarray(0, Math.min(bytes.length, 2048)));
+                if (/<html|<!doctype/i.test(head)) return 'html';
+                return 'unknown';
+            }
+
+            function decodeMobiText(bytes, encoding) {
+                let enc = null;
+                if (encoding === 1252 || encoding === 0) enc = 'windows-1252';
+                else if (encoding === 65001 || encoding === 65000) enc = 'utf-8';
+                else if (encoding === 1200) enc = 'utf-16be';
+                else if (encoding === 65002) enc = 'utf-16le';
+                if (enc) {
+                    try { return new TextDecoder(normalizeEncodingName(enc)).decode(bytes); } catch (e) { /* fallthrough */ }
+                }
+                return decodeBytes(bytes);
+            }
+
+            // 解析原生二进制 MOBI（PalmDB 容器 + 未压缩的头部区 + PalmDoc LZ77 压缩的正文）
+            function parsePalmMobi(arrayBuffer) {
+                const data = new Uint8Array(arrayBuffer);
+                const view = new DataView(arrayBuffer);
+                if (data.length < 78) throw new Error('MOBI 文件头损坏（长度不足）');
+
+                const recordCount = view.getUint16(76);
+                const recs = [];
+                for (let i = 0; i < recordCount; i++) {
+                    const base = 78 + i * 8;
+                    if (base + 4 > data.length) break;
+                    recs.push(view.getUint32(base));
+                }
+                if (recs.length === 0) throw new Error('MOBI 记录表为空');
+
+                // 记录 0 的头部区（PalmDoc 头 + MOBI 头 + EXTH）未压缩，直接从原始字节读取
+                const rec0end = recs.length > 1 ? recs[1] : data.length;
+                const rec0 = data.slice(recs[0], rec0end);
+                if (rec0.length < 20) throw new Error('MOBI 记录 0 长度不足');
+
+                const compression = readU16(rec0, 0);
+                if (compression === 0x0000) compression = 1; // 部分写入器用 0 表示未压缩
+                if (compression !== 1 && compression !== 2) {
+                    throw new Error('不支持的 MOBI 压缩方式: 0x' + compression.toString(16));
+                }
+
+                if (String.fromCharCode(rec0[16], rec0[17], rec0[18], rec0[19]) !== 'MOBI') {
+                    throw new Error('未找到 MOBI 头（文件可能损坏或不是标准 MOBI）');
+                }
+
+                // 权威字段偏移（参考 Calibre / KindleUnpack）：
+                // 20-24: MOBI 头长度 | 28-32: 文本编码 | 128-132: EXTH 标志（bit 0x40）
+                const mobiHeaderLen = readU32(rec0, 20);
+                const textEncoding = readU32(rec0, 28);
+                const exthFlag = readU32(rec0, 128);
+
+                let textStart = 16 + mobiHeaderLen;
+                if ((exthFlag & 0x40) === 0x40 && textStart + 8 <= rec0.length) {
+                    if (String.fromCharCode(rec0[textStart], rec0[textStart + 1], rec0[textStart + 2], rec0[textStart + 3]) === 'EXTH') {
+                        const exthLen = readU32(rec0, textStart + 4);
+                        textStart += ((exthLen + 3) >> 2) << 2; // EXTH 长度按 4 字节对齐
+                    }
+                }
+
+                // 正文记录数：PalmDoc 头偏移 8 的"文本记录数"（正文 = 记录 0 的文本段 + 记录 1..N）
+                let textRecCount = readU16(rec0, 8);
+                if (!(textRecCount >= 0 && textRecCount + 1 <= recs.length)) {
+                    // 头信息不可信时，按"遇到索引/资源魔数即停止"扫描文本记录
+                    textRecCount = 0;
+                    const nonTextMagics = ['INDX', 'TIDX', 'IDXT', 'FLIS', 'FCIS', 'SRCS', 'CMET', 'FONT', 'AUDI', 'VIDE', 'RESC', 'HUFF', 'CDIC'];
+                    for (let i = 1; i < recs.length; i++) {
+                        const s = recs[i];
+                        const e = i + 1 < recs.length ? recs[i + 1] : data.length;
+                        if (s >= e) continue; // 跳过 EOF 哨兵
+                        const magic = String.fromCharCode(data[s], data[s + 1], data[s + 2], data[s + 3]);
+                        if (nonTextMagics.includes(magic)) break;
+                        textRecCount = i;
+                    }
+                }
+
+                // 逐记录解压（记录 0 取头部区之后的文本段）
+                const decode = compression === 2 ? palmdocDecode : (b) => b;
+                const chunks = [decode(rec0.subarray(textStart))];
+                for (let i = 1; i <= textRecCount && i < recs.length; i++) {
+                    const s = recs[i];
+                    const e = i + 1 < recs.length ? recs[i + 1] : data.length;
+                    if (s >= e) continue;
+                    chunks.push(decode(data.slice(s, e)));
+                }
+
+                // 拼接全部正文并解码
+                let total = 0;
+                for (const c of chunks) total += c.length;
+                if (total === 0) throw new Error('MOBI 正文为空');
+                const rawText = new Uint8Array(total);
+                let off = 0;
+                for (const c of chunks) { rawText.set(c, off); off += c.length; }
+
+                const decoded = decodeMobiText(rawText, textEncoding);
+                return htmlToText(decoded);
+            }
+
+            // ----- 文本提取（PDF 分支：分栏检测 + 阈值归一化 + 连字符 + 页眉页脚）-----
             async function extractText(file, format) {
                 const arrayBuffer = await file.arrayBuffer();
                 let text = '';
 
                 if (format === 'txt') {
-                    text = new TextDecoder('utf-8').decode(arrayBuffer);
+                    text = decodeBytes(new Uint8Array(arrayBuffer));
                     if (text.charCodeAt(0) === 0xFEFF) text = text.substring(1);
                 } else if (format === 'pdf') {
                     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-                    let fullText = '';
+                    const pageTexts = [];
 
                     for (let i = 1; i <= pdf.numPages; i++) {
                         const page = await pdf.getPage(i);
                         const content = await page.getTextContent();
-                        // 获取页面尺寸用于计算自适应阈值
-                        const viewport = page.getViewport({ scale: 1 });
-                        const pageHeight = viewport.height;
 
-                        // 提取所有文本项并转换为对象数组，包含 y 坐标和字符串
-                        const items = content.items.map(item => ({
-                            str: item.str,
-                            y: item.transform[5],
-                            x: item.transform[4],
-                            height: item.height || 0
-                        }));
+                        // 提取文本项（含字号与行宽）
+                        const items = content.items
+                            .filter(it => it.str && it.str.trim())
+                            .map(it => ({
+                                str: it.str,
+                                y: it.transform[5],
+                                x: it.transform[4],
+                                width: it.width || (it.str.length * (it.height || 8) * 0.5),
+                                height: it.height || 0
+                            }));
 
-                        // 按 y 降序排序（从页顶到页底）
-                        items.sort((a, b) => b.y - a.y || a.x - b.x);
+                        if (items.length === 0) continue;
 
-                        // 计算平均行高：取所有项高度的中位数或平均值（忽略异常值）
-                        let heights = items.filter(it => it.height > 0).map(it => it.height);
-                        let avgHeight = 0;
-                        if (heights.length > 0) {
-                            heights.sort((a, b) => a - b);
-                            // 取中位数
-                            const mid = Math.floor(heights.length / 2);
-                            avgHeight = heights.length % 2 === 0 ? (heights[mid-1] + heights[mid]) / 2 : heights[mid];
+                        // 主导字高（中位数，缩放无关）
+                        const heights = items.filter(it => it.height > 0).map(it => it.height).sort((a, b) => a - b);
+                        const domH = heights.length ? heights[Math.floor(heights.length / 2)] : 8;
+
+                        // 分栏检测：仅当同一纵向间隙被多行一致支持时才视为栏分隔
+                        // （避免把设计类排版/广告中零散的空隙误判为分栏）
+                        const colBreaks = detectPdfColumns(items, domH);
+                        const columns = [];
+                        if (colBreaks.length >= 1) {
+                            // 多栏：按栏切分
+                            const bounds = [-Infinity, ...colBreaks, Infinity];
+                            for (let c = 0; c < bounds.length - 1; c++) {
+                                const lo = bounds[c], hi = bounds[c + 1];
+                                const colItems = items.filter(it => it.x >= lo && it.x < hi);
+                                if (colItems.length) columns.push(colItems);
+                            }
+                        } else {
+                            columns.push(items);
                         }
-                        // 如果无法计算，使用默认值 8
-                        if (avgHeight < 1) avgHeight = 8;
 
-                        // 自适应阈值：行间距大于平均行高的 1.5 倍视为新段落
-                        const lineThreshold = avgHeight * 1.5;
-                        // 同时考虑最小阈值（防止过小）
-                        const minThreshold = 10;
-
-                        let pageText = '';
-                        let lastY = -999;
-                        let lineBuffer = [];
-
-                        for (const item of items) {
-                            const y = item.y;
-                            // 忽略空字符串
-                            if (!item.str.trim()) continue;
-
-                            if (lastY !== -999 && Math.abs(y - lastY) > Math.max(lineThreshold, minThreshold)) {
-                                // 行间距超出阈值，视为新段落
-                                if (lineBuffer.length > 0) {
-                                    pageText += lineBuffer.join(' ') + '\n\n'; // 双换行表示段落分隔
+                        // 逐栏提取（每栏独立段落合并），单栏时 columns 长度为 1 行为不变
+                        const colTexts = columns.map(colItems => {
+                            // 按 y 降序（页顶到页底），同 y 按 x 升序
+                            const sorted = colItems.slice().sort((a, b) => b.y - a.y || a.x - b.x);
+                            // 行距 = 相邻行 y 差的中位数；段距阈值 = 行距 * 1.6（自适应，缩放无关）
+                            let lineBuffer = [];
+                            let lastY = -999;
+                            const lines = [];
+                            for (const item of sorted) {
+                                const y = item.y;
+                                if (lastY !== -999 && Math.abs(y - lastY) > Math.max(domH * 0.6, 1)) {
+                                    lines.push({ y: lastY, items: lineBuffer });
                                     lineBuffer = [];
                                 }
+                                lineBuffer.push(item);
+                                lastY = y;
                             }
-                            lineBuffer.push(item.str);
-                            lastY = y;
-                        }
-                        // 处理最后一行
-                        if (lineBuffer.length > 0) {
-                            pageText += lineBuffer.join(' ') + '\n\n';
-                        }
+                            if (lineBuffer.length) lines.push({ y: lastY, items: lineBuffer });
 
-                        fullText += pageText + '\n';
+                            const gaps = [];
+                            for (let k = 1; k < lines.length; k++) gaps.push(Math.abs(lines[k].y - lines[k - 1].y));
+                            gaps.sort((a, b) => a - b);
+                            const lineSpacing = gaps.length ? gaps[Math.floor(gaps.length / 2)] : domH;
+                            const paraThresh = Math.max(lineSpacing * 1.6, domH * 1.2);
+
+                            let colText = '';
+                            for (let k = 0; k < lines.length; k++) {
+                                const lineText = joinLineItems(lines[k].items.map(it => it.str));
+                                if (!lineText.trim()) continue;
+                                const prevY = k > 0 ? lines[k - 1].y : null;
+                                if (prevY !== null && Math.abs(prevY - lines[k].y) > paraThresh) {
+                                    colText += '\n\n';
+                                } else if (colText.length > 0) {
+                                    colText += '\n';
+                                }
+                                colText += lineText;
+                            }
+                            return colText.trim();
+                        }).filter(t => t);
+
+                        pageTexts.push(colTexts.join('\n\n'));
                     }
-                    text = fullText;
+
+                    // 页眉/页脚/页码过滤（跨页重复检测）
+                    const headerSet = new Map();
+                    for (const t of pageTexts) {
+                        const lines = t.split('\n').map(l => l.trim()).filter(Boolean);
+                        if (lines.length) {
+                            const first = lines[0], last = lines[lines.length - 1];
+                            headerSet.set(first, (headerSet.get(first) || 0) + 1);
+                            if (last !== first) headerSet.set(last, (headerSet.get(last) || 0) + 1);
+                        }
+                    }
+                    const minRepeat = Math.max(2, Math.floor(pageTexts.length * 0.25));
+                    const headers = new Set();
+                    for (const [line, count] of headerSet) {
+                        if (count >= minRepeat) headers.add(line);
+                    }
+                    // 逐页过滤：丢弃页眉/页脚/纯页码行（空行保留，结构由 cleanText 折叠）
+                    text = pageTexts.map(t => {
+                        return t.split('\n')
+                            .map(l => l.trim())
+                            .map(l => (l && !headers.has(l) && !/^\d{1,3}$/.test(l)) ? l : '')
+                            .join('\n');
+                    }).join('\n\n');
+
+                    // 连字符断词还原：行尾 "-" + 下行首小写 → 合并（去掉连字符与换行）
+                    text = text.replace(/([a-z])-\n+(?=[a-z])/gi, '$1');
                 } else if (format === 'epub') {
                     const book = ePub(arrayBuffer);
                     await book.ready;
-                    let full = '';
-                    const spine = book.spine;
-                    for (let i = 0; i < spine.length; i++) {
-                        const item = spine[i];
+                    const spineItems = book.spine && book.spine.spineItems ? book.spine.spineItems : [];
+                    const parts = [];
+                    for (let i = 0; i < spineItems.length; i++) {
+                        const item = spineItems[i];
                         if (item && item.href) {
                             try {
-                                const section = await book.get(item.href);
-                                if (section) {
-                                    if (section.textContent) {
-                                        full += section.textContent + '\n\n';
-                                    } else if (section.body && section.body.textContent) {
-                                        full += section.body.textContent + '\n\n';
-                                    } else if (typeof section === 'string') {
-                                        const tempDiv = document.createElement('div');
-                                        tempDiv.innerHTML = section;
-                                        full += tempDiv.textContent + '\n\n';
-                                    }
-                                }
+                                // book.load() 返回章节 XHTML 的 XML Document（body 为 null，htmlToText 走 documentElement）
+                                const doc = await book.load(item.href);
+                                const secText = doc ? htmlToText(doc) : '';
+                                const trimmed = (secText || '').trim();
+                                if (trimmed) parts.push(trimmed);
                             } catch (e) {
                                 console.warn('跳过章节:', item.href, e);
                             }
                         }
                     }
-                    text = full;
+                    text = parts.join('\n\n');
                 } else if (format === 'mobi') {
-                    const decoder = new TextDecoder('utf-8');
-                    let raw = decoder.decode(arrayBuffer);
-                    const htmlMatch = raw.match(/<html[^>]*>([\s\S]*?)<\/html>/i);
-                    if (htmlMatch) raw = htmlMatch[1];
-                    raw = raw.replace(/<br\s*\/?>/gi, '\n')
-                             .replace(/<p[^>]*>/gi, '\n')
-                             .replace(/<\/p>/gi, '\n')
-                             .replace(/<[^>]+>/g, '')
-                             .replace(/&nbsp;/g, ' ')
-                             .replace(/&amp;/g, '&')
-                             .replace(/&lt;/g, '<')
-                             .replace(/&gt;/g, '>')
-                             .replace(/&quot;/g, '"');
-                    text = raw;
+                    const bytes = new Uint8Array(arrayBuffer);
+                    const type = detectMobiType(bytes);
+                    if (type === 'palmdb') {
+                        text = parsePalmMobi(arrayBuffer);
+                    } else if (type === 'html') {
+                        text = htmlToText(decodeHtmlBytes(bytes));
+                    } else {
+                        throw new Error('无法识别的文件：既非原生二进制 MOBI（PalmDB），也非 HTML 型 MOBI');
+                    }
                 }
 
                 text = cleanText(text);
-                // 后处理：压缩多余空行，但保留段落间的双换行
-                text = text.replace(/\n{3,}/g, '\n\n'); // 将3个以上换行压缩为2个
+                // 每段输出为一行：段落内行合并，段间空行分隔
+                text = flattenToParaLines(text);
+                // 兜底折叠多余空行
+                text = text.replace(/\n{3,}/g, '\n\n');
                 return text;
             }
 
-            // ----- 生成 PDF（已修正分页）-----
+            // ----- 生成 PDF（逐页渲染，规避长文档 canvas 高度上限）-----
             async function generatePDF(text, title) {
-                const container = document.createElement('div');
-                container.style.cssText = 'position:absolute;left:-9999px;top:0;width:800px;padding:40px;background:white;font-family:system-ui,sans-serif;line-height:1.8;font-size:14px;color:#000;';
+                const { jsPDF } = window.jspdf;
+                const doc = new jsPDF('p', 'mm', 'a4');
+                const pageW = 210, pageH = 297, margin = 10;
+                const usableHmm = pageH - margin * 2;
+                const pxPerMm = 96 / 25.4;
+                const cssWidth = Math.round(pageW * pxPerMm);   // 约 794
+                const usableCssH = usableHmm * pxPerMm;         // 约 1046
 
+                const BASE_STYLE = 'position:absolute;left:-9999px;top:0;width:' + cssWidth + 'px;padding:40px;box-sizing:border-box;background:#ffffff;font-family:system-ui,sans-serif;font-size:14px;line-height:1.8;color:#000;';
+
+                const paragraphs = String(text).replace(/\r\n?/g, '\n').split(/\n{2,}/)
+                    .map(p => p.trim()).filter(Boolean);
+
+                // 1) 测量容器：计算每个块（标题 + 段落）的高度
+                const meas = document.createElement('div');
+                meas.style.cssText = BASE_STYLE;
                 const titleEl = document.createElement('h1');
-                titleEl.textContent = title;
-                titleEl.style.cssText = 'font-size:24px;margin-bottom:20px;text-align:center;';
-                container.appendChild(titleEl);
+                titleEl.style.cssText = 'font-size:24px;text-align:center;padding-bottom:20px;margin:0;';
+                titleEl.textContent = title || '转换文档';
+                meas.appendChild(titleEl);
+                const blocks = [{ text: title || '转换文档', isTitle: true }];
+                for (const p of paragraphs) {
+                    const el = document.createElement('div');
+                    el.style.whiteSpace = 'pre-wrap';
+                    el.style.wordBreak = 'break-word';
+                    el.textContent = p;
+                    meas.appendChild(el);
+                    blocks.push({ text: p, isTitle: false });
+                }
+                document.body.appendChild(meas);
+                blocks.forEach((b, i) => { b.h = meas.children[i].offsetHeight; });
 
-                const contentEl = document.createElement('div');
-                contentEl.style.whiteSpace = 'pre-wrap';
-                contentEl.style.wordBreak = 'break-all';
-                contentEl.textContent = text;
-                container.appendChild(contentEl);
+                // 2) 贪心分页（标题跟随首页，若块自身超页则独占一页）
+                const pages = [];
+                let pageBlocks = [];
+                let packH = 0;
+                for (const b of blocks) {
+                    if (pageBlocks.length > 0 && packH + b.h > usableCssH) {
+                        pages.push(pageBlocks);
+                        pageBlocks = [];
+                        packH = 0;
+                    }
+                    pageBlocks.push(b);
+                    packH += b.h;
+                }
+                if (pageBlocks.length) pages.push(pageBlocks);
 
-                document.body.appendChild(container);
-
+                // 3) 逐页 html2canvas 渲染后合入 PDF
                 try {
-                    const canvas = await html2canvas(container, {
-                        scale: 2,
-                        useCORS: true,
-                        backgroundColor: '#ffffff'
-                    });
-
-                    const { jsPDF } = window.jspdf;
-                    const doc = new jsPDF('p', 'mm', 'a4');
-                    const imgWidth = 210;
-                    const pageHeight = 297;
-                    const margin = 10;
-                    const usableHeight = pageHeight - margin * 2;
-                    const totalHeight = (canvas.height * imgWidth) / canvas.width;
-                    let remaining = totalHeight;
-                    let srcY = 0;
-
-                    while (remaining > 0) {
-                        if (srcY > 0) doc.addPage();
-                        const sliceHeight = Math.min(remaining, usableHeight);
-                        const ratio = sliceHeight / totalHeight;
-                        const canvasSlice = document.createElement('canvas');
-                        canvasSlice.width = canvas.width;
-                        canvasSlice.height = Math.floor(canvas.height * ratio);
-                        const ctx = canvasSlice.getContext('2d');
-                        ctx.drawImage(canvas, 0, srcY, canvas.width, canvas.height * ratio, 0, 0, canvas.width, canvasSlice.height);
-                        const sliceData = canvasSlice.toDataURL('image/jpeg', 0.95);
-                        doc.addImage(sliceData, 'JPEG', 0, margin, imgWidth, sliceHeight);
-                        srcY += canvas.height * ratio;
-                        remaining -= sliceHeight;
+                    for (let pi = 0; pi < pages.length; pi++) {
+                        const pageEl = document.createElement('div');
+                        pageEl.style.cssText = BASE_STYLE;
+                        for (const b of pages[pi]) {
+                            const el = document.createElement(b.isTitle ? 'h1' : 'div');
+                            if (b.isTitle) {
+                                el.style.cssText = 'font-size:24px;text-align:center;padding-bottom:20px;margin:0;';
+                            } else {
+                                el.style.whiteSpace = 'pre-wrap';
+                                el.style.wordBreak = 'break-word';
+                            }
+                            el.textContent = b.text;
+                            pageEl.appendChild(el);
+                        }
+                        document.body.appendChild(pageEl);
+                        try {
+                            const canvas = await html2canvas(pageEl, {
+                                scale: 2,
+                                useCORS: true,
+                                backgroundColor: '#ffffff'
+                            });
+                            const renderedHmm = canvas.height * (pageW / canvas.width);
+                            const fitHmm = Math.min(renderedHmm, usableHmm);
+                            const y = margin + (usableHmm - fitHmm) / 2;
+                            const imgData = canvas.toDataURL('image/jpeg', 0.95);
+                            if (pi > 0) doc.addPage();
+                            doc.addImage(imgData, 'JPEG', 0, y, pageW, fitHmm);
+                        } finally {
+                            document.body.removeChild(pageEl);
+                        }
                     }
                     return doc.output('blob');
                 } finally {
-                    document.body.removeChild(container);
+                    document.body.removeChild(meas);
                 }
             }
 
@@ -517,7 +958,9 @@
   <navMap><navPoint id="navpoint-1" playOrder="1"><navLabel><text>正文</text></navLabel><content src="chapter1.xhtml"/></navPoint></navMap>
 </ncx>`);
 
-                const paragraphs = text.split('\n').filter(p => p.trim() !== '').map(p => `<p>${escapeXml(p.trim())}</p>`).join('\n');
+                const paragraphs = text.replace(/\r\n?/g, '\n').split(/\n{2,}/)
+                    .map(p => p.trim()).filter(Boolean)
+                    .map(p => `<p>${escapeXml(p).replace(/\n/g, '<br/>')}</p>`).join('\n');
                 zip.file("OEBPS/chapter1.xhtml", `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml">
@@ -534,7 +977,9 @@
                     '<': '&lt;', '>': '&gt;', '&': '&amp;', '\'': '&apos;', '"': '&quot;'
                 }[c]));
 
-                const paragraphs = text.split('\n').filter(p => p.trim() !== '').map(p => `<p>${escapeHtml(p.trim())}</p>`).join('\n');
+                const paragraphs = text.replace(/\r\n?/g, '\n').split(/\n{2,}/)
+                    .map(p => p.trim()).filter(Boolean)
+                    .map(p => `<p>${escapeHtml(p).replace(/\n/g, '<br/>')}</p>`).join('\n');
                 const htmlContent = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${escapeHtml(title)}</title></head><body><h1>${escapeHtml(title)}</h1>${paragraphs}</body></html>`;
                 return new Blob([htmlContent], { type: "application/x-mobipocket-ebook" });
             }

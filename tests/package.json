@@ -1,0 +1,11 @@
+{
+  "name": "filetrans-tests",
+  "private": true,
+  "description": "单元测试：从 index.html 提取纯逻辑函数并验证（EPUB/MOBI→TXT 解析、编码检测、CJK 拼接等）",
+  "scripts": {
+    "test": "node run-tests.js"
+  },
+  "devDependencies": {
+    "jsdom": "^29.0.0"
+  }
+}
