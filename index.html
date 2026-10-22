@@ -1251,7 +1251,7 @@
                 const rec0 = new Uint8Array(data.slice(rec0Start, rec0End));
                 if (rec0.length < 20) return null;
                 const encryptionType = readU16(rec0, 12);
-                if (encryptionType !== 0) return null; // DRM 保护文件不可无损转换
+                if (encryptionType !== 0) return null; // DRM
                 let compression = readU16(rec0, 0);
                 if (compression === 0) compression = 1;
                 if (compression !== 1 && compression !== 2) return null;
@@ -1259,6 +1259,8 @@
                 const mobiHeaderLen = readU32(rec0, 20);
                 const textEncoding = readU32(rec0, 28);
                 const exthFlag = readU32(rec0, 128);
+                const origTextRecCount = readU16(rec0, 8);
+                const recordSize = readU16(rec0, 10) || 4096;
                 let textStart = 16 + mobiHeaderLen;
                 if ((exthFlag & 0x40) === 0x40 && textStart + 8 <= rec0.length) {
                     if (String.fromCharCode(rec0[textStart], rec0[textStart + 1], rec0[textStart + 2], rec0[textStart + 3]) === 'EXTH') {
@@ -1270,78 +1272,111 @@
                 const encName = mobiEncodingName(textEncoding);
                 if (!encName || encName === 'windows-1252') return null;
 
-                let textRecCount = readU16(rec0, 8);
-                const nonTextMagics = ['INDX', 'TIDX', 'IDXT', 'FLIS', 'FCIS', 'SRCS', 'CMET', 'FONT', 'AUDI', 'VIDE', 'RESC', 'HUFF', 'CDIC', 'KF8B'];
-                if (!(textRecCount >= 0 && textRecCount + 1 <= recs.length)) {
-                    textRecCount = 0;
-                    for (let i = 1; i < recs.length; i++) {
-                        const s = recs[i];
-                        const e = i + 1 < recs.length ? recs[i + 1] : data.length;
-                        if (s >= e) continue;
-                        const magic = String.fromCharCode(data[s], data[s + 1], data[s + 2], data[s + 3]);
-                        if (nonTextMagics.includes(magic)) break;
-                        textRecCount = i;
+                // 读取全部原始正文（旧 MOBI 全文）
+                const decode = (b) => (compression === 2 ? palmdocDecode(b) : b);
+                let fullDecoded = new Uint8Array(0);
+                const textRecs = Math.max(1, Math.min(origTextRecCount + 1, recordCount - 1));
+                const parts = [];
+                // 记录0仅取 textStart 之后的正文段
+                const rec0seg = rec0.subarray(textStart);
+                parts.push(decode(rec0seg));
+                for (let i = 1; i < textRecs && i < recordCount; i++) {
+                    const s = recs[i];
+                    const e = i + 1 < recordCount ? recs[i + 1] : data.length;
+                    if (s >= e) continue;
+                    const rawRec = data.slice(s, e);
+                    parts.push(decode(rawRec));
+                }
+                // 重新组装为单个文本缓冲区
+                let total = 0;
+                for (const p of parts) total += p.length;
+                const fullBuf = new Uint8Array(total);
+                let off = 0;
+                for (const p of parts) { fullBuf.set(p, off); off += p.length; }
+                const fullText = decodeForMobi(fullBuf, encName);
+                const convText = conv(fullText);
+
+                // 重新按字符边界切块，避免多字节被截断
+                function utf8ByteLength(str) { return new TextEncoder().encode(str).length; }
+                const chunks = [];
+                let cur = '';
+                let curBytes = 0;
+                for (const ch of convText) {
+                    const b = utf8ByteLength(ch);
+                    if (curBytes > 0 && curBytes + b > Math.max(256, (recordSize || 4096) - 64)) {
+                        chunks.push(cur);
+                        cur = ch;
+                        curBytes = b;
+                    } else {
+                        cur += ch;
+                        curBytes += b;
                     }
                 }
-                const decode = (b) => (compression === 2 ? palmdocDecode(b) : b);
-                // rec0 段落
-                const rec0Seg = rec0.subarray(textStart);
-                const dec0 = decode(rec0Seg);
-                const text0 = decodeForMobi(dec0, encName);
-                const conv0 = conv(text0);
-                const enc0 = encodeForMobi(conv0, encName);
-                if (!enc0) return null;
-                const comp0 = compression === 2 ? compressPalmDoc(enc0) : enc0;
-                const rec0New = new Uint8Array(textStart + comp0.length);
-                rec0New.set(rec0.subarray(0, textStart), 0);
-                rec0New.set(comp0, textStart);
-                let totalText = enc0.length;
+                if (cur) chunks.push(cur);
+                if (chunks.length === 0) chunks.push('');
 
+                const encodedChunks = chunks.map(ch => encodeForMobi(ch, encName));
+                if (encodedChunks.some(x => !x)) return null;
+                const compChunks = encodedChunks.map(ec => (compression === 2 ? compressPalmDoc(ec) : ec));
+                const totalText = encodedChunks.reduce((a, b) => a + b.length, 0);
+
+                // 重建 PalmDoc 记录
                 const newRecords = [];
+                const rec0Header = rec0.slice(0, textStart);
+                const firstComp = compChunks[0];
+                const rec0New = new Uint8Array(rec0Header.length + firstComp.length);
+                rec0New.set(rec0Header, 0);
+                rec0New.set(firstComp, rec0Header.length);
+                const rv = new DataView(rec0New.buffer);
+                rv.setUint32(4, totalText); // 正文长度
+                // 原始正文记录数 + 其它记录的透传
                 newRecords.push(rec0New);
-                for (let i = 1; i <= textRecCount && i < recs.length; i++) {
-                    const s = recs[i];
-                    const e = i + 1 < recs.length ? recs[i + 1] : data.length;
-                    if (s >= e) { newRecords.push(new Uint8Array(0)); continue; }
-                    const raw = data.slice(s, e);
-                    const dec = decode(raw);
-                    const txt = decodeForMobi(dec, encName);
-                    const cv = conv(txt);
-                    const en = encodeForMobi(cv, encName);
-                    if (!en) return null;
-                    const co = compression === 2 ? compressPalmDoc(en) : en;
-                    totalText += en.length;
-                    newRecords.push(co);
-                }
-                // 透传后续记录
-                for (let i = textRecCount + 1; i < recordCount; i++) {
+                for (let i = 1; i < compChunks.length; i++) newRecords.push(compChunks[i]);
+                // 透传分隔/资源记录（从原正文记录末尾开始）
+                const passStart = textRecs;
+                for (let i = passStart; i < recordCount; i++) {
                     const s = recs[i];
                     const e = i + 1 < recordCount ? recs[i + 1] : data.length;
                     if (s >= e) { newRecords.push(new Uint8Array(0)); continue; }
                     newRecords.push(data.slice(s, e));
                 }
-                // 记录数应与 newRecords 数量一致
-                if (newRecords.length !== recordCount) return null;
 
-                // 设置 rec0 中的正文长度字段（PalmDoc 头偏移 4）
-                const rv = new DataView(rec0New.buffer);
-                rv.setUint32(4, totalText);
+                // 更新正文记录数字段（records after rec0）
+                rv.setUint16(8, newRecords.length - 1);
+                // 更新第一非正文记录索引
+                const origFirstNonBook = readU32(rec0, 80);
+                const sepCount = Math.max(0, origFirstNonBook - textRecs);
+                if (origFirstNonBook >= textRecs) {
+                    rv.setUint32(80, newRecords.length + sepCount);
+                }
 
-                // 重建文件
-                const headerLen = 78 + recordCount * 8;
-                const out = new Uint8Array(headerLen + newRecords.reduce((a, b) => a + b.length, 0));
-                out.set(data.slice(0, 78), 0);
-                let pos = headerLen;
-                for (let i = 0; i < recordCount; i++) {
-                    const dv = new DataView(out.buffer);
-                    dv.setUint32(78 + i * 8, pos);
-                    const tail = data.slice(78 + i * 8 + 4, 78 + i * 8 + 8);
-                    out.set(tail, 78 + i * 8 + 4);
-                    out.set(newRecords[i], pos);
+                const headerLen = 78 + newRecords.length * 8; // record count 可能变化
+                // 保持 PalmDB 原始记录数？若变化会导致容器记录集合变化；仅更新 header 的 count 字段
+                const dbView = new DataView(new Uint8Array(78).buffer);
+                const newFileHeader = new Uint8Array(78 + newRecords.length * 8);
+                newFileHeader.set(data.slice(0, 78), 0);
+                const dbHeader = new DataView(newFileHeader.buffer);
+                dbHeader.setUint16(76, newRecords.length);
+                let pos = newFileHeader.length;
+                for (let i = 0; i < newRecords.length; i++) {
+                    dbHeader.setUint32(78 + i * 8, pos);
+                    const tailBase = 78 + i * 8 + 4;
+                    if (i < recs.length) {
+                        const tail = data.slice(78 + i * 8 + 4, 78 + i * 8 + 8);
+                        if (tail.length === 4) newFileHeader.set(tail, tailBase);
+                    }
                     pos += newRecords[i].length;
+                }
+                const out = new Uint8Array(pos);
+                out.set(newFileHeader, 0);
+                let p2 = newFileHeader.length;
+                for (let i = 0; i < newRecords.length; i++) {
+                    out.set(newRecords[i], p2);
+                    p2 += newRecords[i].length;
                 }
                 return out.buffer;
             }
+
 
             async function convertTextLossless(file, conv) {
                 const buf = await file.arrayBuffer();
