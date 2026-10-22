@@ -1049,6 +1049,7 @@
                 const fromFmt = currentFormat;
                 const toFmt = targetFormat.value;
                 const zhMode = zhFileMode.value;
+                const canLossless = zhMode !== 'none' && toFmt === fromFmt && ['txt', 'html', 'htm', 'epub', 'mobi', 'azw', 'azw3'].includes(fromFmt);
 
                 if (fromFmt === toFmt && zhMode === 'none') {
                     showStatus('源格式与目标格式相同，无需转换', 'error');
@@ -1063,7 +1064,32 @@
                 showStatus('正在提取文本...', 'info');
 
                 try {
-                    let text = await extractText(currentFile, fromFmt);
+                    const baseName = currentFile.name.replace(/\.[^.]+$/, '') || 'converted';
+                    let blob = null;
+                    let losslessDone = false;
+                    if (canLossless) {
+                        try {
+                            showStatus('正在进行无损简繁转换（保持排版）...', 'info');
+                            setProgress(20);
+                            const OpenCC = await loadOpenCC();
+                            const conv = zhMode === 's2t' ? OpenCC.Converter({ from: 'cn', to: 'tw' }) : OpenCC.Converter({ from: 'tw', to: 'cn' });
+                            if (fromFmt === 'txt' || fromFmt === 'html' || fromFmt === 'htm') {
+                                blob = await convertTextLossless(currentFile, conv);
+                            } else if (fromFmt === 'epub') {
+                                blob = await convertEpubLossless(currentFile, conv);
+                            } else {
+                                blob = new Blob([await convertKindleLossless(currentFile, conv)], { type: 'application/octet-stream' });
+                            }
+                            losslessDone = true;
+                            setProgress(90);
+                        } catch (e) {
+                            console.warn('无损转换失败，回退到文本流程:', e);
+                            losslessDone = false;
+                            blob = null;
+                        }
+                    }
+                    if (!losslessDone) {
+                        let text = await extractText(currentFile, fromFmt);
                     if (!text || !text.trim()) {
                         throw new Error('未能从文件中提取到任何文字内容');
                     }
@@ -1077,9 +1103,6 @@
                     setProgress(40);
                     showStatus('正在生成目标文件...', 'info');
 
-                    const baseName = currentFile.name.replace(/\.[^.]+$/, '') || 'converted';
-                    let blob;
-
                     if (toFmt === 'txt') {
                         blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
                     } else if (toFmt === 'pdf') {
@@ -1092,6 +1115,7 @@
                         blob = generateMOBI(text, baseName);
                     }
 
+                    }
                     setProgress(90);
                     showStatus('转换完成，准备下载...', 'success');
 
@@ -1110,6 +1134,242 @@
                 } finally {
                     toggleLoading(false);
                 }
+            }
+
+            // ---------- 无损简繁转换（保持原文件结构/排版） ----------
+            function compressPalmDoc(data) {
+                const out = [];
+                let i = 0;
+                const ldata = data.length;
+                function rindexSub(hay, needle, from) {
+                    for (let pos = from - needle.length; pos >= 0; pos--) {
+                        let match = true;
+                        for (let k = 0; k < needle.length; k++) {
+                            if (hay[pos + k] !== needle[k]) { match = false; break; }
+                        }
+                        if (match) return pos;
+                    }
+                    return -1;
+                }
+                while (i < ldata) {
+                    if (i > 10 && (ldata - i) > 10) {
+                        let chunk = null, match = -1;
+                        for (let j = 10; j > 2; j--) {
+                            chunk = data.subarray(i, i + j);
+                            match = rindexSub(data, chunk, i);
+                            if (match >= 0 && (i - match) <= 2047) break;
+                            match = -1;
+                        }
+                        if (match >= 0) {
+                            const n = chunk.length;
+                            const m = i - match;
+                            const code = 0x8000 + ((m << 3) & 0x3FF8) + (n - 3);
+                            out.push((code >> 8) & 0xFF, code & 0xFF);
+                            i += n;
+                            continue;
+                        }
+                    }
+                    const och = data[i]; i += 1;
+                    if (och === 0x20 && i < ldata) {
+                        const onch = data[i];
+                        if (onch >= 0x40 && onch < 0x80) {
+                            out.push(onch ^ 0x80);
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    if (och === 0 || (och > 8 && och < 0x80)) {
+                        out.push(och);
+                    } else {
+                        let j = i;
+                        const binseq = [och];
+                        while (j < ldata && binseq.length < 8) {
+                            const c = data[j];
+                            if (c === 0 || (c > 8 && c < 0x80)) break;
+                            binseq.push(c);
+                            j += 1;
+                        }
+                        out.push(binseq.length);
+                        for (const b of binseq) out.push(b);
+                        i += binseq.length - 1;
+                    }
+                }
+                return new Uint8Array(out);
+            }
+
+            function mobiEncodingName(code) {
+                if (code === 1252 || code === 0) return 'windows-1252';
+                if (code === 65001 || code === 65000) return 'utf-8';
+                if (code === 1200) return 'utf-16be';
+                if (code === 65002) return 'utf-16le';
+                return null;
+            }
+
+            function encodeForMobi(text, name) {
+                if (name === 'utf-8') return new TextEncoder().encode(text);
+                if (name === 'utf-16le' || name === 'utf-16be') {
+                    const arr = new Uint8Array(text.length * 2);
+                    for (let i = 0; i < text.length; i++) {
+                        const cp = text.charCodeAt(i);
+                        if (name === 'utf-16le') { arr[i * 2] = cp & 0xFF; arr[i * 2 + 1] = (cp >> 8) & 0xFF; }
+                        else { arr[i * 2] = (cp >> 8) & 0xFF; arr[i * 2 + 1] = cp & 0xFF; }
+                    }
+                    return arr;
+                }
+                // windows-1252：仅允许 8 位 ASCII/拉丁字符；含中文时返回 null
+                let ok = true;
+                const arr = new Uint8Array(text.length);
+                for (let i = 0; i < text.length; i++) {
+                    const cp = text.charCodeAt(i);
+                    if (cp > 0xFF) { ok = false; break; }
+                    arr[i] = cp;
+                }
+                return ok ? arr : null;
+            }
+
+            function decodeForMobi(bytes, name) {
+                try { return new TextDecoder(name === 'windows-1252' ? 'windows-1252' : name).decode(bytes); }
+                catch (e) { return new TextDecoder('latin1').decode(bytes); }
+            }
+
+            function rebuildMobiScript(arrayBuffer, conv) {
+                const data = new Uint8Array(arrayBuffer);
+                const view = new DataView(arrayBuffer);
+                if (data.length < 78) return null;
+                const recordCount = view.getUint16(76);
+                if (recordCount < 2) return null;
+                const recs = [];
+                for (let i = 0; i < recordCount; i++) {
+                    const base = 78 + i * 8;
+                    if (base + 4 > data.length) break;
+                    recs.push(view.getUint32(base));
+                }
+                if (recs.length !== recordCount) return null;
+                const rec0Start = recs[0];
+                const rec0End = recs[1];
+                if (rec0End <= rec0Start) return null;
+                const rec0 = new Uint8Array(data.slice(rec0Start, rec0End));
+                if (rec0.length < 20) return null;
+                let compression = readU16(rec0, 0);
+                if (compression === 0) compression = 1;
+                if (compression !== 1 && compression !== 2) return null;
+                if (String.fromCharCode(rec0[16], rec0[17], rec0[18], rec0[19]) !== 'MOBI') return null;
+                const mobiHeaderLen = readU32(rec0, 20);
+                const textEncoding = readU32(rec0, 28);
+                const exthFlag = readU32(rec0, 128);
+                let textStart = 16 + mobiHeaderLen;
+                if ((exthFlag & 0x40) === 0x40 && textStart + 8 <= rec0.length) {
+                    if (String.fromCharCode(rec0[textStart], rec0[textStart + 1], rec0[textStart + 2], rec0[textStart + 3]) === 'EXTH') {
+                        const exthLen = readU32(rec0, textStart + 4);
+                        textStart += ((exthLen + 3) >> 2) << 2;
+                    }
+                }
+                if (textStart > rec0.length) return null;
+                const encName = mobiEncodingName(textEncoding);
+                if (!encName || encName === 'windows-1252') return null;
+
+                let textRecCount = readU16(rec0, 8);
+                const nonTextMagics = ['INDX', 'TIDX', 'IDXT', 'FLIS', 'FCIS', 'SRCS', 'CMET', 'FONT', 'AUDI', 'VIDE', 'RESC', 'HUFF', 'CDIC', 'KF8B'];
+                if (!(textRecCount >= 0 && textRecCount + 1 <= recs.length)) {
+                    textRecCount = 0;
+                    for (let i = 1; i < recs.length; i++) {
+                        const s = recs[i];
+                        const e = i + 1 < recs.length ? recs[i + 1] : data.length;
+                        if (s >= e) continue;
+                        const magic = String.fromCharCode(data[s], data[s + 1], data[s + 2], data[s + 3]);
+                        if (nonTextMagics.includes(magic)) break;
+                        textRecCount = i;
+                    }
+                }
+                const decode = (b) => (compression === 2 ? palmdocDecode(b) : b);
+                // rec0 段落
+                const rec0Seg = rec0.subarray(textStart);
+                const dec0 = decode(rec0Seg);
+                const text0 = decodeForMobi(dec0, encName);
+                const conv0 = conv(text0);
+                const enc0 = encodeForMobi(conv0, encName);
+                if (!enc0) return null;
+                const comp0 = compression === 2 ? compressPalmDoc(enc0) : enc0;
+                const rec0New = new Uint8Array(textStart + comp0.length);
+                rec0New.set(rec0.subarray(0, textStart), 0);
+                rec0New.set(comp0, textStart);
+                let totalText = enc0.length;
+
+                const newRecords = [];
+                newRecords.push(rec0New);
+                for (let i = 1; i <= textRecCount && i < recs.length; i++) {
+                    const s = recs[i];
+                    const e = i + 1 < recs.length ? recs[i + 1] : data.length;
+                    if (s >= e) { newRecords.push(new Uint8Array(0)); continue; }
+                    const raw = data.slice(s, e);
+                    const dec = decode(raw);
+                    const txt = decodeForMobi(dec, encName);
+                    const cv = conv(txt);
+                    const en = encodeForMobi(cv, encName);
+                    if (!en) return null;
+                    const co = compression === 2 ? compressPalmDoc(en) : en;
+                    totalText += en.length;
+                    newRecords.push(co);
+                }
+                // 透传后续记录
+                for (let i = textRecCount + 1; i < recordCount; i++) {
+                    const s = recs[i];
+                    const e = i + 1 < recordCount ? recs[i + 1] : data.length;
+                    if (s >= e) { newRecords.push(new Uint8Array(0)); continue; }
+                    newRecords.push(data.slice(s, e));
+                }
+                // 记录数应与 newRecords 数量一致
+                if (newRecords.length !== recordCount) return null;
+
+                // 设置 rec0 中的正文长度字段（PalmDoc 头偏移 4）
+                const rv = new DataView(rec0New.buffer);
+                rv.setUint32(4, totalText);
+
+                // 重建文件
+                const headerLen = 78 + recordCount * 8;
+                const out = new Uint8Array(headerLen + newRecords.reduce((a, b) => a + b.length, 0));
+                out.set(data.slice(0, 78), 0);
+                let pos = headerLen;
+                for (let i = 0; i < recordCount; i++) {
+                    const dv = new DataView(out.buffer);
+                    dv.setUint32(78 + i * 8, pos);
+                    const tail = data.slice(78 + i * 8 + 4, 78 + i * 8 + 8);
+                    out.set(tail, 78 + i * 8 + 4);
+                    out.set(newRecords[i], pos);
+                    pos += newRecords[i].length;
+                }
+                return out.buffer;
+            }
+
+            async function convertTextLossless(file, conv) {
+                const buf = await file.arrayBuffer();
+                const bytes = new Uint8Array(buf);
+                const ext = file.name.split('.').pop().toLowerCase();
+                const text = (ext === 'html' || ext === 'htm')
+                    ? decodeHtmlBytes(bytes)
+                    : decodeBytes(bytes);
+                return new Blob([conv(text)], { type: file.type || 'text/plain;charset=utf-8' });
+            }
+
+            async function convertEpubLossless(file, conv) {
+                const zip = await JSZip.loadAsync(file);
+                const paths = Object.keys(zip.files);
+                for (const pth of paths) {
+                    const entry = zip.files[pth];
+                    if (entry.dir) continue;
+                    if (!/\.(x?html?|htm|xml)$/i.test(pth)) continue;
+                    let t = '';
+                    try { t = await entry.async('string'); } catch (e) { continue; }
+                    zip.file(pth, conv(t));
+                }
+                return await zip.generateAsync({ type: 'blob', mimeType: 'application/epub+zip' });
+            }
+
+            async function convertKindleLossless(file, conv) {
+                const buf = await file.arrayBuffer();
+                const out = rebuildMobiScript(buf, conv);
+                if (!out) throw new Error('无法无损转换该 Kindle 文件');
+                return out;
             }
 
             convertBtn.addEventListener('click', startConversion);
