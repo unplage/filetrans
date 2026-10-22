@@ -1250,6 +1250,8 @@
                 if (rec0End <= rec0Start) return null;
                 const rec0 = new Uint8Array(data.slice(rec0Start, rec0End));
                 if (rec0.length < 20) return null;
+                const encryptionType = readU16(rec0, 12);
+                if (encryptionType !== 0) return null; // DRM 保护文件不可无损转换
                 let compression = readU16(rec0, 0);
                 if (compression === 0) compression = 1;
                 if (compression !== 1 && compression !== 2) return null;
