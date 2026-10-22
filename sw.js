@@ -7,7 +7,7 @@ const BASE_PATH = self.location.pathname.replace(/[^/]+$/, '');
 // 构建带项目标识的缓存名称，避免多项目冲突
 // 例如 '/pwa1/' -> 'pwa-cache-pwa1-v1'
 const CACHE_PREFIX = `pwa-cache${BASE_PATH.replace(/\//g, '-')}`;
-const CACHE_NAME = `${CACHE_PREFIX}v5`;
+const CACHE_NAME = `${CACHE_PREFIX}v6`;
 
 // 预缓存资源列表（全部使用相对于当前 sw.js 的路径）
 const PRECACHE_URLS = [
@@ -70,6 +70,22 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
+
+  // OpenCC 简繁转换库：跨域但缓存到本项目缓存，供离线重复使用
+  if (url.hostname === 'cdn.jsdelivr.net' && url.pathname.includes('/opencc-js/') && request.method === 'GET') {
+    event.respondWith(
+      caches.open(CACHE_NAME).then(cache => cache.match(request).then(cached => {
+        if (cached) return cached;
+        return fetch(request).then(networkResponse => {
+          if (networkResponse && networkResponse.status === 200) {
+            cache.put(request, networkResponse.clone());
+          }
+          return networkResponse;
+        }).catch(() => new Response('', { status: 408 }));
+      }))
+    );
+    return;
+  }
 
   // 只处理同源 GET 请求
   if (url.origin !== location.origin || request.method !== 'GET') {

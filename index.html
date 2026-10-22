@@ -42,7 +42,7 @@
                 </svg>
                 <p class="text-gray-600 font-medium mb-1">拖拽文件到这里，或点击选择</p>
                 <p class="text-sm text-gray-400">支持 PDF, EPUB, TXT, MOBI</p>
-                <input type="file" id="fileInput" accept=".pdf,.epub,.txt,.mobi" class="hidden">
+                <input type="file" id="fileInput" accept=".pdf,.epub,.txt,.mobi,.azw,.azw3" class="hidden">
             </div>
         </div>
 
@@ -65,6 +65,7 @@
                     <option value="pdf">PDF (文档)</option>
                     <option value="epub">EPUB (电子书)</option>
                     <option value="mobi">MOBI (Kindle邮箱推送)</option>
+                    <option value="azw3">AZW3 (Kindle)</option>
                 </select>
                 <p class="text-xs text-gray-500 mt-1" id="formatHint"></p>
             </div>
@@ -98,6 +99,32 @@
         <div id="historyArea" class="hidden border-t border-gray-200 pt-4 mt-2">
             <h3 class="text-sm font-semibold text-gray-600 mb-2">📋 转换历史</h3>
             <div id="historyList" class="max-h-40 overflow-y-auto space-y-1"></div>
+        </div>
+
+        <!-- 中文简繁转换 -->
+        <div class="border-t border-gray-200 pt-4 mt-2 space-y-3">
+            <h3 class="text-sm font-semibold text-gray-600">🔤 中文简繁转换</h3>
+            <textarea id="zhInput" rows="5" placeholder="请输入需要转换的中文文本…" class="w-full p-3 border border-gray-300 rounded-lg text-sm focus:border-blue-500 focus:ring-blue-500"></textarea>
+            <div class="flex flex-col sm:flex-row gap-2 items-end">
+                <div class="flex-1 w-full">
+                    <label class="block text-xs text-gray-500 mb-1">转换方向</label>
+                    <select id="zhDirection" class="w-full p-2.5 border border-gray-300 rounded-lg shadow-sm focus:border-blue-500 focus:ring-blue-500 bg-white text-sm">
+                        <option value="s2t">简体 → 繁体</option>
+                        <option value="t2s">繁体 → 简体</option>
+                    </select>
+                </div>
+                <button id="zhConvertBtn" class="w-full sm:w-32 bg-blue-600 text-white py-2.5 px-4 rounded-lg hover:bg-blue-700 transition-colors text-sm flex items-center justify-center gap-2 h-11">
+                    <span id="zhBtnText">开始转换</span>
+                    <div id="zhBtnSpinner" class="hidden spinner w-4 h-4 border-2 border-white rounded-full"></div>
+                </button>
+                <button id="zhClearBtn" class="w-full sm:w-20 bg-gray-100 text-gray-600 py-2.5 px-3 rounded-lg hover:bg-gray-200 transition-colors text-sm h-11">清空</button>
+            </div>
+            <textarea id="zhOutput" rows="5" readonly placeholder="转换结果…" class="w-full p-3 border border-gray-200 rounded-lg text-sm bg-gray-50"></textarea>
+            <div class="flex gap-2">
+                <button id="zhCopyBtn" class="text-sm text-blue-600 hover:text-blue-800 px-3 py-1.5 rounded-lg border border-blue-200 hover:bg-blue-50 transition-colors">复制结果</button>
+                <button id="zhDownloadBtn" class="text-sm text-gray-500 hover:text-gray-700 px-3 py-1.5 rounded-lg border border-gray-300 hover:bg-gray-50 transition-colors">下载 TXT</button>
+            </div>
+            <p id="zhStatus" class="text-xs text-gray-500 hidden"></p>
         </div>
     </main>
 
@@ -152,6 +179,16 @@
             const historyArea = document.getElementById('historyArea');
             const historyList = document.getElementById('historyList');
             const formatHint = document.getElementById('formatHint');
+            const zhInput = document.getElementById('zhInput');
+            const zhDirection = document.getElementById('zhDirection');
+            const zhConvertBtn = document.getElementById('zhConvertBtn');
+            const zhBtnText = document.getElementById('zhBtnText');
+            const zhBtnSpinner = document.getElementById('zhBtnSpinner');
+            const zhClearBtn = document.getElementById('zhClearBtn');
+            const zhOutput = document.getElementById('zhOutput');
+            const zhCopyBtn = document.getElementById('zhCopyBtn');
+            const zhDownloadBtn = document.getElementById('zhDownloadBtn');
+            const zhStatus = document.getElementById('zhStatus');
 
             // ----- 状态 -----
             let currentFile = null;
@@ -164,7 +201,8 @@
                 'txt': '通用纯文本格式',
                 'pdf': '适合打印和固定排版',
                 'epub': '适合手机和电子书阅读器',
-                'mobi': '适用于 Kindle 邮箱推送（生成 HTML 结构，服务端会自动转换）'
+                'mobi': '适用于 Kindle 邮箱推送（生成 HTML 结构，服务端会自动转换）',
+                'azw3': '生成 HTML 结构（Kindle 邮箱推送 / 本地打开）'
             };
             targetFormat.addEventListener('change', (e) => {
                 formatHint.textContent = formatHints[e.target.value] || '';
@@ -240,8 +278,8 @@
             function handleFile(file) {
                 if (!file) return;
                 const ext = file.name.split('.').pop().toLowerCase();
-                if (!['pdf', 'epub', 'txt', 'mobi'].includes(ext)) {
-                    showStatus('仅支持 PDF, EPUB, TXT, MOBI 格式', 'error');
+                if (!['pdf', 'epub', 'txt', 'mobi', 'azw', 'azw3'].includes(ext)) {
+                    showStatus('仅支持 PDF, EPUB, TXT, MOBI, AZW, AZW3 格式', 'error');
                     return;
                 }
                 revokeUrl();
@@ -813,15 +851,21 @@
                         }
                     }
                     text = parts.join('\n\n');
-                } else if (format === 'mobi') {
+                } else if (format === 'mobi' || format === 'azw' || format === 'azw3') {
                     const bytes = new Uint8Array(arrayBuffer);
                     const type = detectMobiType(bytes);
                     if (type === 'palmdb') {
-                        text = parsePalmMobi(arrayBuffer);
+                        try {
+                            text = parsePalmMobi(arrayBuffer);
+                        } catch (e) {
+                            text = htmlToText(decodeHtmlBytes(bytes));
+                        }
                     } else if (type === 'html') {
                         text = htmlToText(decodeHtmlBytes(bytes));
                     } else {
-                        throw new Error('无法识别的文件：既非原生二进制 MOBI（PalmDB），也非 HTML 型 MOBI');
+                        // AZW3/KF8 等 PalmDB 变体：退化为 HTML/文本解码
+                        try { text = parsePalmMobi(arrayBuffer); }
+                        catch (e) { text = htmlToText(decodeHtmlBytes(bytes)); }
                     }
                 }
 
@@ -1023,6 +1067,8 @@
                         blob = await generateEPUB(text, baseName);
                     } else if (toFmt === 'mobi') {
                         blob = generateMOBI(text, baseName);
+                    } else if (toFmt === 'azw3') {
+                        blob = generateMOBI(text, baseName);
                     }
 
                     setProgress(90);
@@ -1046,6 +1092,80 @@
             }
 
             convertBtn.addEventListener('click', startConversion);
+
+            // ---------- 中文简繁转换（基于 OpenCC，懒加载） ----------
+            let openccLoading = null;
+            function loadOpenCC() {
+                if (window.OpenCC) return Promise.resolve(window.OpenCC);
+                if (openccLoading) return openccLoading;
+                openccLoading = new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    script.src = 'https://cdn.jsdelivr.net/npm/opencc-js@1.0.5/dist/umd/full.js';
+                    script.async = true;
+                    script.onload = () => window.OpenCC ? resolve(window.OpenCC) : reject(new Error('OpenCC 未正确加载'));
+                    script.onerror = () => { openccLoading = null; reject(new Error('无法加载 OpenCC 库，请检查网络')); };
+                    document.head.appendChild(script);
+                });
+                return openccLoading;
+            }
+
+            function showZhStatus(msg, type = 'info') {
+                zhStatus.textContent = msg;
+                zhStatus.classList.remove('hidden');
+                if (type === 'error') zhStatus.className = 'text-xs text-red-600';
+                else if (type === 'success') zhStatus.className = 'text-xs text-green-600';
+                else zhStatus.className = 'text-xs text-gray-500';
+            }
+
+            function toggleZhLoading(loading) {
+                zhConvertBtn.disabled = loading;
+                zhBtnText.textContent = loading ? '转换中...' : '开始转换';
+                zhBtnSpinner.classList.toggle('hidden', !loading);
+            }
+
+            async function convertChinese() {
+                const text = zhInput.value;
+                if (!text || !text.trim()) {
+                    showZhStatus('请输入需要转换的文本', 'error');
+                    return;
+                }
+                toggleZhLoading(true);
+                zhStatus.classList.add('hidden');
+                try {
+                    const OpenCC = await loadOpenCC();
+                    const direction = zhDirection.value;
+                    const conv = direction === 's2t'
+                        ? OpenCC.Converter({ from: 'cn', to: 'tw' })
+                        : OpenCC.Converter({ from: 'tw', to: 'cn' });
+                    zhOutput.value = conv(text);
+                    showZhStatus('转换完成', 'success');
+                } catch (e) {
+                    console.error('ZH Convert Error:', e);
+                    showZhStatus('转换失败：' + (e && e.message ? e.message : e), 'error');
+                } finally {
+                    toggleZhLoading(false);
+                }
+            }
+
+            zhConvertBtn.addEventListener('click', convertChinese);
+            zhClearBtn.addEventListener('click', () => { zhInput.value = ''; zhOutput.value = ''; zhStatus.classList.add('hidden'); });
+            zhCopyBtn.addEventListener('click', async () => {
+                try {
+                    await navigator.clipboard.writeText(zhOutput.value);
+                    showZhStatus('已复制到剪贴板', 'success');
+                } catch (e) {
+                    showZhStatus('复制失败，请手动选择文本', 'error');
+                }
+            });
+            zhDownloadBtn.addEventListener('click', () => {
+                if (!zhOutput.value) return;
+                const url = URL.createObjectURL(new Blob([zhOutput.value], { type: 'text/plain;charset=utf-8' }));
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'zh-convert.txt';
+                a.click();
+                setTimeout(() => URL.revokeObjectURL(url), 0);
+            });
 
             // ---------- PWA 动态 manifest ----------
             function initPWA() {

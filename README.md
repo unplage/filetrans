@@ -18,6 +18,8 @@
 
 📋 转换历史：保存最近 20 条转换记录，方便查看
 
+🔤 中文简繁转换：支持简体 ↔ 繁体互转（基于 OpenCC，首次使用需联网，之后可离线）
+
 🎨 现代化 UI：基于 Tailwind CSS，适配桌面和移动端
 
 🔒 隐私安全：所有文件仅在本地处理，不上传任何数据
@@ -27,7 +29,7 @@
 PDF	TXT, EPUB, MOBI	提取纯文本，智能分栏/段落合并，CJK 拼接，连字符还原，页眉页脚过滤；转 TXT 每段一行
 EPUB	TXT, PDF, MOBI	解析章节，按块级元素保留段落/标题
 TXT	PDF, EPUB, MOBI	自动识别编码（UTF-8 / GB18030 / Big5 等）
-MOBI	TXT, PDF, EPUB	原生二进制（PalmDB/PalmDoc）与 HTML 型均可解析
+MOBI / AZW / AZW3	TXT, PDF, EPUB, MOBI	原生二进制（PalmDB/PalmDoc）与 HTML 型均可解析；AZW3 以兼容方式输出 HTML 结构
 注意：MOBI 生成采用 HTML 结构（兼容 Kindle 邮箱推送），非原生二进制 MOBI。若需原生格式，建议先转 EPUB，再通过亚马逊“发送至 Kindle”服务云端转换。
 
 🚀 快速开始
