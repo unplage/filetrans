@@ -6,14 +6,12 @@
 const BASE_PATH = self.location.pathname.replace(/[^/]+$/, '');
 // 构建带项目标识的缓存名称，避免多项目冲突
 // 例如 '/pwa1/' -> 'pwa-cache-pwa1-v1'
-const CACHE_NAME = `pwa-cache${BASE_PATH.replace(/\//g, '-')}v4`;
+const CACHE_PREFIX = `pwa-cache${BASE_PATH.replace(/\//g, '-')}`;
+const CACHE_NAME = `${CACHE_PREFIX}v5`;
 
 // 预缓存资源列表（全部使用相对于当前 sw.js 的路径）
 const PRECACHE_URLS = [
-  `${BASE_PATH}sw.js`,
   `${BASE_PATH}index.html`,
-  `${BASE_PATH}manifest.json`,
-  `${BASE_PATH}fontawesome.min.css`,
 ];
 
 // 静态资源扩展名（用于判断是否缓存优先）
@@ -52,7 +50,13 @@ self.addEventListener('activate', (event) => {
     caches.keys().then(cacheNames => {
       return Promise.all(
         cacheNames
-          .filter(cache => cache.startsWith('pwa-cache-') && cache !== CACHE_NAME)
+          // 只清理“本项目”的旧版本缓存（如 /filetrans/ 只删 pwa-cache-filetrans-vN），
+          // 绝不动同 origin 下其他 PWA 的缓存（如 pwa-cache-pintu-vN）
+          .filter(cache =>
+            cache.startsWith(CACHE_PREFIX) &&
+            /^v\d+$/.test(cache.slice(CACHE_PREFIX.length)) &&
+            cache !== CACHE_NAME
+          )
           .map(cache => {
             console.log('[SW] 删除旧缓存:', cache);
             return caches.delete(cache);
@@ -84,8 +88,8 @@ self.addEventListener('fetch', (event) => {
           return networkResponse;
         })
         .catch(async () => {
-          // 网络失败，尝试从缓存获取
-          const cachedResponse = await caches.match(request);
+          // 网络失败，尝试从本项目缓存获取（不跨缓存查找，避免命中其他 PWA）
+          const cachedResponse = await caches.open(CACHE_NAME).then(cache => cache.match(request));
           if (cachedResponse) {
             console.log('[SW] 离线模式，使用缓存页面:', url.pathname);
             return cachedResponse;
@@ -93,7 +97,7 @@ self.addEventListener('fetch', (event) => {
           // 连缓存都没有，返回自定义离线页（可预置 offline.html）
           // 如果希望更美观，可以预缓存一个 offline.html 并在这里返回它
           return new Response(
-            '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>仿素记日记 - 离线</title><style>body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#F8F9FA;display:flex;align-items:center;justify-content:center;min-height:100vh;color:#333}.card{text-align:center;padding:40px 20px}.icon{font-size:64px;margin-bottom:16px}.title{font-size:24px;font-weight:600;margin-bottom:8px}.desc{font-size:16px;color:#777;margin-bottom:24px}.btn{display:inline-block;padding:12px 32px;background:#5D5CDE;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;text-decoration:none}.btn:hover{background:#4a4abf}</style></head><body><div class="card"><div class="icon">📴</div><div class="title">网络已断开</div><div class="desc">仿素记日记无法加载最新页面<br>请检查网络连接后刷新</div><button class="btn" onclick="location.reload()">重新加载</button></div></body></html>',
+            '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>文转大师 - 离线</title><style>body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#F8F9FA;display:flex;align-items:center;justify-content:center;min-height:100vh;color:#333}.card{text-align:center;padding:40px 20px}.icon{font-size:64px;margin-bottom:16px}.title{font-size:24px;font-weight:600;margin-bottom:8px}.desc{font-size:16px;color:#777;margin-bottom:24px}.btn{display:inline-block;padding:12px 32px;background:#5D5CDE;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;text-decoration:none}.btn:hover{background:#4a4abf}</style></head><body><div class="card"><div class="icon">📴</div><div class="title">网络已断开</div><div class="desc">文转大师无法加载最新页面<br>请检查网络连接后刷新</div><button class="btn" onclick="location.reload()">重新加载</button></div></body></html>',
             { status: 503, statusText: 'Offline', headers: { 'Content-Type': 'text/html;charset=UTF-8' } }
           );
         })
@@ -104,7 +108,7 @@ self.addEventListener('fetch', (event) => {
   // ----- 5.2 静态资源请求：缓存优先，未命中则网络请求并缓存 -----
   if (isStaticResource(url)) {
     event.respondWith(
-      caches.match(request).then(cachedResponse => {
+      caches.open(CACHE_NAME).then(cache => cache.match(request)).then(cachedResponse => {
         if (cachedResponse) {
           return cachedResponse;
         }
