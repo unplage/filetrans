@@ -1248,7 +1248,7 @@
                 const rec0Start = recs[0];
                 const rec0End = recs[1];
                 if (rec0End <= rec0Start) return null;
-                const rec0 = new Uint8Array(data.slice(rec0Start, rec0End));
+                let rec0 = new Uint8Array(data.slice(rec0Start, rec0End));
                 if (rec0.length < 20) return null;
                 const encryptionType = readU16(rec0, 12);
                 if (encryptionType !== 0) return null; // DRM
@@ -1258,8 +1258,57 @@
                 if (String.fromCharCode(rec0[16], rec0[17], rec0[18], rec0[19]) !== 'MOBI') return null;
                 const mobiHeaderLen = readU32(rec0, 20);
                 const textEncoding = readU32(rec0, 28);
+                const encNameTmp = mobiEncodingName(textEncoding);
                 const exthFlag = readU32(rec0, 128);
                 const origTextRecCount = readU16(rec0, 8); // continuation count
+                const exthStart = 16 + mobiHeaderLen;
+                // 转换 EXTH 中的可文本字段（书名、作者、出版社、主题、描述等），fix 元数据/目录标题
+                if ((exthFlag & 0x40) === 0x40 && exthStart + 12 <= rec0.length &&
+                    String.fromCharCode(rec0[exthStart], rec0[exthStart + 1], rec0[exthStart + 2], rec0[exthStart + 3]) === 'EXTH') {
+                    const stringTypes = new Set([100,101,102,103,104,105,106,107,108,109,110,111,112,113,503,504,524,527,535]);
+                    const oldExthLen = readU32(rec0, exthStart + 4);
+                    const recCount = readU32(rec0, exthStart + 8);
+                    let off = exthStart + 12;
+                    const entries = [];
+                    for (let i = 0; i < recCount && off + 8 <= exthStart + oldExthLen; i++) {
+                        const type = readU32(rec0, off);
+                        const len = readU32(rec0, off + 4);
+                        if (len < 8 || off + len > exthStart + oldExthLen) break;
+                        const rawVal = rec0.slice(off + 8, off + len);
+                        let val = rawVal;
+                        if (stringTypes.has(type)) {
+                            const txt = decodeForMobi(rawVal, encNameTmp || 'utf-8');
+                            const convTxt = conv(txt);
+                            const enc = encodeForMobi(convTxt, encNameTmp || 'utf-8');
+                            if (enc) val = enc;
+                        }
+                        entries.push({ type, val });
+                        off += len;
+                    }
+                    // rebuild EXTH
+                    let newLen = 12;
+                    for (const e of entries) newLen += 8 + e.val.length;
+                    const paddedLen = (newLen + 3) & ~3;
+                    const newExth = new Uint8Array(paddedLen);
+                    newExth[0]=0x45; newExth[1]=0x58; newExth[2]=0x54; newExth[3]=0x48;
+                    const v = new DataView(newExth.buffer);
+                    v.setUint32(4, newLen);
+                    v.setUint32(8, entries.length);
+                    let o2 = 12;
+                    for (const e of entries) {
+                        v.setUint32(o2, e.type);
+                        v.setUint32(o2 + 4, 8 + e.val.length);
+                        newExth.set(e.val, o2 + 8);
+                        o2 += 8 + e.val.length;
+                    }
+                    const before = rec0.slice(0, exthStart);
+                    const after = rec0.slice(exthStart + oldExthLen);
+                    const newRec0 = new Uint8Array(before.length + paddedLen + after.length);
+                    newRec0.set(before, 0);
+                    newRec0.set(newExth, before.length);
+                    newRec0.set(after, before.length + paddedLen);
+                    rec0 = newRec0;
+                }
                 let textStart = 16 + mobiHeaderLen;
                 if ((exthFlag & 0x40) === 0x40 && textStart + 8 <= rec0.length) {
                     if (String.fromCharCode(rec0[textStart], rec0[textStart + 1], rec0[textStart + 2], rec0[textStart + 3]) === 'EXTH') {
@@ -1268,7 +1317,7 @@
                     }
                 }
                 if (textStart > rec0.length) return null;
-                const encName = mobiEncodingName(textEncoding);
+                const encName = encNameTmp;
                 if (!encName || encName === 'windows-1252') return null;
                 const decode = (b) => (compression === 2 ? palmdocDecode(b) : b);
                 const origTextRecs = Math.max(1, Math.min(origTextRecCount + 1, recordCount - 1));
