@@ -75,6 +75,19 @@
             </button>
         </div>
 
+        <!-- 中文处理 -->
+        <div class="flex flex-col sm:flex-row gap-3 items-end">
+            <div class="flex-1 w-full">
+                <label class="block text-sm font-medium text-gray-700 mb-1">中文处理</label>
+                <select id="zhFileMode" class="w-full p-2.5 border border-gray-300 rounded-lg shadow-sm focus:border-blue-500 focus:ring-blue-500 bg-white">
+                    <option value="none">不处理（保持原文）</option>
+                    <option value="t2s">繁体 → 简体</option>
+                    <option value="s2t">简体 → 繁体</option>
+                </select>
+                <p class="text-xs text-gray-500 mt-1" id="zhFileHint">对提取文本进行简繁转换后重新生成文件</p>
+            </div>
+        </div>
+
         <!-- 进度条 & 状态 -->
         <div id="progressArea" class="hidden space-y-1">
             <div class="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
@@ -179,6 +192,7 @@
             const historyArea = document.getElementById('historyArea');
             const historyList = document.getElementById('historyList');
             const formatHint = document.getElementById('formatHint');
+            const zhFileMode = document.getElementById('zhFileMode');
             const zhInput = document.getElementById('zhInput');
             const zhDirection = document.getElementById('zhDirection');
             const zhConvertBtn = document.getElementById('zhConvertBtn');
@@ -1034,8 +1048,9 @@
 
                 const fromFmt = currentFormat;
                 const toFmt = targetFormat.value;
+                const zhMode = zhFileMode.value;
 
-                if (fromFmt === toFmt) {
+                if (fromFmt === toFmt && zhMode === 'none') {
                     showStatus('源格式与目标格式相同，无需转换', 'error');
                     return;
                 }
@@ -1048,9 +1063,15 @@
                 showStatus('正在提取文本...', 'info');
 
                 try {
-                    const text = await extractText(currentFile, fromFmt);
+                    let text = await extractText(currentFile, fromFmt);
                     if (!text || !text.trim()) {
                         throw new Error('未能从文件中提取到任何文字内容');
+                    }
+
+                    if (zhMode !== 'none') {
+                        setProgress(30);
+                        showStatus('正在转换中文简繁...', 'info');
+                        text = await convertChineseText(text, zhMode);
                     }
 
                     setProgress(40);
@@ -1123,6 +1144,17 @@
                 zhBtnSpinner.classList.toggle('hidden', !loading);
             }
 
+            async function convertChineseText(text, direction) {
+                const OpenCC = await loadOpenCC();
+                const conv = direction === 's2t'
+                    ? OpenCC.Converter({ from: 'cn', to: 'tw' })
+                    : direction === 't2s'
+                        ? OpenCC.Converter({ from: 'tw', to: 'cn' })
+                        : null;
+                if (!conv) return text;
+                return conv(text);
+            }
+
             async function convertChinese() {
                 const text = zhInput.value;
                 if (!text || !text.trim()) {
@@ -1134,10 +1166,7 @@
                 try {
                     const OpenCC = await loadOpenCC();
                     const direction = zhDirection.value;
-                    const conv = direction === 's2t'
-                        ? OpenCC.Converter({ from: 'cn', to: 'tw' })
-                        : OpenCC.Converter({ from: 'tw', to: 'cn' });
-                    zhOutput.value = conv(text);
+                    zhOutput.value = await convertChineseText(text, direction);
                     showZhStatus('转换完成', 'success');
                 } catch (e) {
                     console.error('ZH Convert Error:', e);
