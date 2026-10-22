@@ -1259,8 +1259,7 @@
                 const mobiHeaderLen = readU32(rec0, 20);
                 const textEncoding = readU32(rec0, 28);
                 const exthFlag = readU32(rec0, 128);
-                const origTextRecCount = readU16(rec0, 8);
-                const recordSize = readU16(rec0, 10) || 4096;
+                const origTextRecCount = readU16(rec0, 8); // continuation count
                 let textStart = 16 + mobiHeaderLen;
                 if ((exthFlag & 0x40) === 0x40 && textStart + 8 <= rec0.length) {
                     if (String.fromCharCode(rec0[textStart], rec0[textStart + 1], rec0[textStart + 2], rec0[textStart + 3]) === 'EXTH') {
@@ -1271,39 +1270,37 @@
                 if (textStart > rec0.length) return null;
                 const encName = mobiEncodingName(textEncoding);
                 if (!encName || encName === 'windows-1252') return null;
-
-                // 读取全部原始正文（旧 MOBI 全文）
                 const decode = (b) => (compression === 2 ? palmdocDecode(b) : b);
-                let fullDecoded = new Uint8Array(0);
-                const textRecs = Math.max(1, Math.min(origTextRecCount + 1, recordCount - 1));
-                const parts = [];
-                // 记录0仅取 textStart 之后的正文段
-                const rec0seg = rec0.subarray(textStart);
-                parts.push(decode(rec0seg));
-                for (let i = 1; i < textRecs && i < recordCount; i++) {
+                const origTextRecs = Math.max(1, Math.min(origTextRecCount + 1, recordCount - 1));
+
+                // 解码原书全部正文（按纪录拼接后再一次性解码，避免 record 边界 artifacts）
+                let total = 0;
+                const rawParts = [];
+                // 记录0正文段
+                rawParts.push(data.slice(rec0Start + textStart, recs[1]));
+                for (let i = 1; i < origTextRecs && i < recordCount; i++) {
                     const s = recs[i];
                     const e = i + 1 < recordCount ? recs[i + 1] : data.length;
                     if (s >= e) continue;
-                    const rawRec = data.slice(s, e);
-                    parts.push(decode(rawRec));
+                    rawParts.push(data.slice(s, e));
                 }
-                // 重新组装为单个文本缓冲区
-                let total = 0;
-                for (const p of parts) total += p.length;
+                for (const p of rawParts) total += p.length;
                 const fullBuf = new Uint8Array(total);
                 let off = 0;
-                for (const p of parts) { fullBuf.set(p, off); off += p.length; }
-                const fullText = decodeForMobi(fullBuf, encName);
+                for (const p of rawParts) { fullBuf.set(p, off); off += p.length; }
+                const decFull = (compression === 2 ? palmdocDecode(fullBuf) : fullBuf);
+                const fullText = decodeForMobi(decFull, encName);
                 const convText = conv(fullText);
 
-                // 重新按字符边界切块，避免多字节被截断
-                function utf8ByteLength(str) { return new TextEncoder().encode(str).length; }
+                // 按字符边界切块，保证每块可独立解码（不使用 trailing extra bytes）
+                function utf8Bytes(s) { return new TextEncoder().encode(s).length; }
                 const chunks = [];
                 let cur = '';
                 let curBytes = 0;
+                const chunkLimit = 4000;
                 for (const ch of convText) {
-                    const b = utf8ByteLength(ch);
-                    if (curBytes > 0 && curBytes + b > Math.max(256, (recordSize || 4096) - 64)) {
+                    const b = utf8Bytes(ch);
+                    if (curBytes > 0 && curBytes + b > chunkLimit) {
                         chunks.push(cur);
                         cur = ch;
                         curBytes = b;
@@ -1312,28 +1309,25 @@
                         curBytes += b;
                     }
                 }
-                if (cur) chunks.push(cur);
-                if (chunks.length === 0) chunks.push('');
+                if (cur || chunks.length === 0) chunks.push(cur);
 
-                const encodedChunks = chunks.map(ch => encodeForMobi(ch, encName));
-                if (encodedChunks.some(x => !x)) return null;
-                const compChunks = encodedChunks.map(ec => (compression === 2 ? compressPalmDoc(ec) : ec));
-                const totalText = encodedChunks.reduce((a, b) => a + b.length, 0);
+                const encChunks = chunks.map(c => encodeForMobi(c, encName));
+                if (encChunks.some(x => !x)) return null;
+                const compChunks = encChunks.map(ec => (compression === 2 ? compressPalmDoc(ec) : ec));
+                const totalText = encChunks.reduce((a, b) => a + b.length, 0);
 
-                // 重建 PalmDoc 记录
+                // 记录0 + 正文 chunk 记录
                 const newRecords = [];
-                const rec0Header = rec0.slice(0, textStart);
+                const rec0Header = rec0.subarray(0, textStart);
                 const firstComp = compChunks[0];
                 const rec0New = new Uint8Array(rec0Header.length + firstComp.length);
                 rec0New.set(rec0Header, 0);
                 rec0New.set(firstComp, rec0Header.length);
-                const rv = new DataView(rec0New.buffer);
-                rv.setUint32(4, totalText); // 正文长度
-                // 原始正文记录数 + 其它记录的透传
                 newRecords.push(rec0New);
                 for (let i = 1; i < compChunks.length; i++) newRecords.push(compChunks[i]);
-                // 透传分隔/资源记录（从原正文记录末尾开始）
-                const passStart = textRecs;
+
+                // 原文文本段末尾后的分隔/资源记录透传
+                const passStart = origTextRecs;
                 for (let i = passStart; i < recordCount; i++) {
                     const s = recs[i];
                     const e = i + 1 < recordCount ? recs[i + 1] : data.length;
@@ -1341,35 +1335,31 @@
                     newRecords.push(data.slice(s, e));
                 }
 
-                // 更新正文记录数字段（records after rec0）
+                // 更新 PalmDoc 正文长度与正文记录数字段
+                const rv = new DataView(rec0New.buffer);
+                rv.setUint32(4, totalText);
                 rv.setUint16(8, newRecords.length - 1);
-                // 更新第一非正文记录索引
                 const origFirstNonBook = readU32(rec0, 80);
-                const sepCount = Math.max(0, origFirstNonBook - textRecs);
-                if (origFirstNonBook >= textRecs) {
+                const sepCount = Math.max(0, origFirstNonBook - origTextRecs);
+                if (origFirstNonBook >= origTextRecs) {
                     rv.setUint32(80, newRecords.length + sepCount);
                 }
 
-                const headerLen = 78 + newRecords.length * 8; // record count 可能变化
-                // 保持 PalmDB 原始记录数？若变化会导致容器记录集合变化；仅更新 header 的 count 字段
-                const dbView = new DataView(new Uint8Array(78).buffer);
-                const newFileHeader = new Uint8Array(78 + newRecords.length * 8);
-                newFileHeader.set(data.slice(0, 78), 0);
-                const dbHeader = new DataView(newFileHeader.buffer);
-                dbHeader.setUint16(76, newRecords.length);
-                let pos = newFileHeader.length;
+                // 重建文件
+                const newHeader = new Uint8Array(78 + newRecords.length * 8);
+                newHeader.set(data.slice(0, 78), 0);
+                const dvHeader = new DataView(newHeader.buffer);
+                dvHeader.setUint16(76, newRecords.length);
+                let pos = newHeader.length;
                 for (let i = 0; i < newRecords.length; i++) {
-                    dbHeader.setUint32(78 + i * 8, pos);
-                    const tailBase = 78 + i * 8 + 4;
-                    if (i < recs.length) {
-                        const tail = data.slice(78 + i * 8 + 4, 78 + i * 8 + 8);
-                        if (tail.length === 4) newFileHeader.set(tail, tailBase);
-                    }
+                    dvHeader.setUint32(78 + i * 8, pos);
+                    const tail = data.slice(78 + i * 8 + 4, 78 + i * 8 + 8);
+                    if (tail.length === 4) newHeader.set(tail, 78 + i * 8 + 4);
                     pos += newRecords[i].length;
                 }
                 const out = new Uint8Array(pos);
-                out.set(newFileHeader, 0);
-                let p2 = newFileHeader.length;
+                out.set(newHeader, 0);
+                let p2 = newHeader.length;
                 for (let i = 0; i < newRecords.length; i++) {
                     out.set(newRecords[i], p2);
                     p2 += newRecords[i].length;
