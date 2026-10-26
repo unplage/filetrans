@@ -114,6 +114,53 @@
             <div id="historyList" class="max-h-40 overflow-y-auto space-y-1"></div>
         </div>
 
+        <!-- 文件繁简转换（无损 · 同格式） -->
+        <div class="border-t border-gray-200 pt-4 mt-2 space-y-3">
+            <h3 class="text-sm font-semibold text-gray-600">🔤 文件繁简转换（无损 · 同格式）</h3>
+            <p class="text-xs text-gray-500">仅对 TXT / HTML / EPUB / MOBI / AZW / AZW3 文件进行字符转换，保持原文件格式与结构不变。</p>
+            <div id="zhFileDropZone" class="border-2 border-dashed border-gray-300 rounded-xl p-6 text-center cursor-pointer transition-colors hover:border-blue-400 hover:bg-blue-50">
+                <p class="text-gray-600 text-sm">拖拽文件到这里，或点击选择</p>
+                <p class="text-xs text-gray-400 mt-1">支持 TXT, HTML, EPUB, MOBI, AZW, AZW3</p>
+                <input type="file" id="zhFileInput" accept=".txt,.html,.htm,.epub,.mobi,.azw,.azw3" class="hidden">
+            </div>
+            <div id="zhFileInfoPanel" class="hidden bg-blue-50 p-3 rounded-lg text-sm text-blue-700 flex justify-between items-center">
+                <div class="truncate">
+                    <span class="font-semibold">📎</span>
+                    <span id="zhFileName" class="font-medium"></span>
+                    <span class="ml-2 text-xs bg-blue-200 px-2 py-0.5 rounded-full" id="zhFileFormat"></span>
+                </div>
+                <button id="zhFileRemoveBtn" class="text-red-500 hover:text-red-700 text-lg font-bold px-2 ml-2 flex-shrink-0">✕</button>
+            </div>
+            <div class="flex flex-col sm:flex-row gap-3 items-end">
+                <div class="flex-1 w-full">
+                    <label class="block text-xs text-gray-500 mb-1">转换方向</label>
+                    <select id="zhFileDirection" class="w-full p-2.5 border border-gray-300 rounded-lg shadow-sm focus:border-blue-500 focus:ring-blue-500 bg-white text-sm">
+                        <option value="t2s">繁体 → 简体</option>
+                        <option value="s2t">简体 → 繁体</option>
+                    </select>
+                </div>
+                <button id="zhFileConvertBtn" disabled class="w-full sm:w-40 bg-blue-600 text-white py-2.5 px-5 rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2 h-11 text-sm">
+                    <span id="zhFileBtnText">开始转换</span>
+                    <div id="zhFileBtnSpinner" class="hidden spinner w-5 h-5 border-2 border-white rounded-full"></div>
+                </button>
+            </div>
+            <div id="zhFileProgressArea" class="hidden space-y-1">
+                <div class="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+                    <div id="zhFileProgressBar" class="progress-bar bg-blue-600 h-full rounded-full" style="width:0%"></div>
+                </div>
+                <p id="zhFileStatus" class="text-sm text-gray-600 text-center">就绪</p>
+            </div>
+            <div id="zhFileResult" class="hidden bg-green-50 p-4 rounded-lg flex flex-wrap items-center justify-between gap-3">
+                <span class="text-sm text-green-700 font-medium">✅ 转换完成！</span>
+                <div class="flex gap-2">
+                    <a id="zhFileDownloadLink" class="bg-green-600 text-white py-2 px-4 rounded-lg hover:bg-green-700 transition-colors text-sm flex items-center gap-1 cursor-pointer">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                        下载文件
+                    </a>
+                </div>
+            </div>
+        </div>
+
         <!-- 中文简繁转换 -->
         <div class="border-t border-gray-200 pt-4 mt-2 space-y-3">
             <h3 class="text-sm font-semibold text-gray-600">🔤 中文简繁转换</h3>
@@ -203,12 +250,31 @@
             const zhCopyBtn = document.getElementById('zhCopyBtn');
             const zhDownloadBtn = document.getElementById('zhDownloadBtn');
             const zhStatus = document.getElementById('zhStatus');
+            const zhFileDropZone = document.getElementById('zhFileDropZone');
+            const zhFileInput = document.getElementById('zhFileInput');
+            const zhFileInfoPanel = document.getElementById('zhFileInfoPanel');
+            const zhFileName = document.getElementById('zhFileName');
+            const zhFileFormat = document.getElementById('zhFileFormat');
+            const zhFileRemoveBtn = document.getElementById('zhFileRemoveBtn');
+            const zhFileDirection = document.getElementById('zhFileDirection');
+            const zhFileConvertBtn = document.getElementById('zhFileConvertBtn');
+            const zhFileBtnText = document.getElementById('zhFileBtnText');
+            const zhFileBtnSpinner = document.getElementById('zhFileBtnSpinner');
+            const zhFileProgressArea = document.getElementById('zhFileProgressArea');
+            const zhFileProgressBar = document.getElementById('zhFileProgressBar');
+            const zhFileStatus = document.getElementById('zhFileStatus');
+            const zhFileResult = document.getElementById('zhFileResult');
+            const zhFileDownloadLink = document.getElementById('zhFileDownloadLink');
 
             // ----- 状态 -----
             let currentFile = null;
             let currentFormat = '';
             let isConverting = false;
             let lastDownloadUrl = null;
+            let zhFileCurrent = null;
+            let zhFileFmt = '';
+            let zhFileConverting = false;
+            let zhFileDownloadUrl = null;
 
             // ----- 辅助提示 -----
             const formatHints = {
@@ -1056,6 +1122,11 @@
                     return;
                 }
 
+                if (zhMode !== 'none' && toFmt !== fromFmt) {
+                    showStatus('繁简转换仅支持相同文件格式：请将目标格式与源文件保持一致', 'error');
+                    return;
+                }
+
                 toggleLoading(true);
                 revokeUrl();
                 resultSection.classList.add('hidden');
@@ -1447,6 +1518,133 @@
                 if (!out) throw new Error('无法无损转换该 Kindle 文件');
                 return out;
             }
+
+
+            // ---------- 文件繁简转换（无损 · 同格式） ----------
+            function revokeZhFileUrl() {
+                if (zhFileDownloadUrl) {
+                    URL.revokeObjectURL(zhFileDownloadUrl);
+                    zhFileDownloadUrl = null;
+                }
+            }
+
+            function showZhFileStatus(msg, type = 'info') {
+                zhFileStatus.textContent = msg;
+                zhFileProgressArea.classList.remove('hidden');
+                if (type === 'error') zhFileStatus.className = 'text-sm text-red-600 text-center';
+                else if (type === 'success') zhFileStatus.className = 'text-sm text-green-600 text-center';
+                else zhFileStatus.className = 'text-sm text-gray-600 text-center';
+            }
+
+            function setZhFileProgress(pct) {
+                zhFileProgressBar.style.width = Math.min(100, pct) + '%';
+            }
+
+            function toggleZhFileLoading(loading) {
+                zhFileConverting = loading;
+                zhFileConvertBtn.disabled = loading;
+                zhFileBtnText.textContent = loading ? '转换中...' : '开始转换';
+                zhFileBtnSpinner.classList.toggle('hidden', !loading);
+            }
+
+            function zhFileExt(file) {
+                return (file.name.split('.').pop() || '').toLowerCase();
+            }
+
+            zhFileDropZone.addEventListener('click', () => zhFileInput.click());
+            zhFileDropZone.addEventListener('dragover', (e) => { e.preventDefault(); zhFileDropZone.classList.add('drag-over'); });
+            zhFileDropZone.addEventListener('dragleave', () => zhFileDropZone.classList.remove('drag-over'));
+            zhFileDropZone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                zhFileDropZone.classList.remove('drag-over');
+                if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                    zhFileInput.files = e.dataTransfer.files;
+                    zhFileInput.dispatchEvent(new Event('change'));
+                }
+            });
+
+            zhFileInput.addEventListener('change', (e) => {
+                const f = e.target.files && e.target.files[0];
+                if (!f) return;
+                const ext = zhFileExt(f);
+                if (!['txt', 'html', 'htm', 'epub', 'mobi', 'azw', 'azw3'].includes(ext)) {
+                    showZhFileStatus('不支持的文件格式', 'error');
+                    zhFileInput.value = '';
+                    return;
+                }
+                zhFileCurrent = f;
+                zhFileFmt = ext;
+                zhFileName.textContent = f.name;
+                zhFileFormat.textContent = ext.toUpperCase();
+                zhFileInfoPanel.classList.remove('hidden');
+                zhFileResult.classList.add('hidden');
+                revokeZhFileUrl();
+                zhFileConvertBtn.disabled = false;
+                showZhFileStatus('已选择文件，点击开始转换', 'info');
+                setZhFileProgress(0);
+            });
+
+            zhFileRemoveBtn.addEventListener('click', () => {
+                zhFileCurrent = null;
+                zhFileFmt = '';
+                zhFileInput.value = '';
+                zhFileInfoPanel.classList.add('hidden');
+                zhFileResult.classList.add('hidden');
+                revokeZhFileUrl();
+                zhFileConvertBtn.disabled = true;
+                zhFileProgressArea.classList.add('hidden');
+            });
+
+            async function convertZhFile() {
+                if (!zhFileCurrent || zhFileConverting) return;
+                const file = zhFileCurrent;
+                const ext = zhFileFmt;
+                const dir = zhFileDirection.value;
+
+                toggleZhFileLoading(true);
+                revokeZhFileUrl();
+                zhFileResult.classList.add('hidden');
+                zhFileProgressArea.classList.remove('hidden');
+                setZhFileProgress(10);
+                showZhFileStatus('正在准备...', 'info');
+
+                try {
+                    const OpenCC = await loadOpenCC();
+                    const conv = dir === 's2t'
+                        ? OpenCC.Converter({ from: 'cn', to: 'tw' })
+                        : OpenCC.Converter({ from: 'tw', to: 'cn' });
+
+                    setZhFileProgress(20);
+                    showZhFileStatus('正在进行无损繁简转换...', 'info');
+
+                    let blob = null;
+                    if (ext === 'txt' || ext === 'html' || ext === 'htm') {
+                        blob = await convertTextLossless(file, conv);
+                    } else if (ext === 'epub') {
+                        blob = await convertEpubLossless(file, conv);
+                    } else {
+                        blob = new Blob([await convertKindleLossless(file, conv)], { type: 'application/octet-stream' });
+                    }
+                    if (!blob) throw new Error('转换失败');
+
+                    setZhFileProgress(90);
+                    zhFileDownloadUrl = URL.createObjectURL(blob);
+                    zhFileDownloadLink.href = zhFileDownloadUrl;
+                    const baseName = file.name.replace(/\.[^.]+$/, '') || 'converted';
+                    zhFileDownloadLink.download = baseName + '.' + ext;
+                    zhFileResult.classList.remove('hidden');
+                    showZhFileStatus('转换完成', 'success');
+                    setZhFileProgress(100);
+                } catch (error) {
+                    console.error('ZH File Convert Error:', error);
+                    showZhFileStatus('转换失败：' + (error && error.message ? error.message : error), 'error');
+                    setZhFileProgress(0);
+                } finally {
+                    toggleZhFileLoading(false);
+                }
+            }
+
+            zhFileConvertBtn.addEventListener('click', convertZhFile);
 
             convertBtn.addEventListener('click', startConversion);
 
