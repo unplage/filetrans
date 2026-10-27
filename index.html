@@ -712,6 +712,24 @@
                 return decodeBytes(bytes);
             }
 
+            // 计算 record 0 中压缩文本的起始位置（考虑 EXTH 和标题区域）
+            function computeTextStartInRec0(rec0, mobiHeaderLen, exthFlag, titleOffset, titleLength) {
+                let pos = 16 + mobiHeaderLen;
+                if ((exthFlag & 0x40) === 0x40 && pos + 8 <= rec0.length) {
+                    if (String.fromCharCode(rec0[pos], rec0[pos + 1], rec0[pos + 2], rec0[pos + 3]) === 'EXTH') {
+                        const exthLen = readU32(rec0, pos + 4);
+                        pos += ((exthLen + 3) >> 2) << 2; // EXTH 长度按 4 字节对齐
+                    }
+                }
+                const exthEnd = pos;
+                // 如果标题在 record 0 中（titleOffset >= exthEnd 且 titleLength > 0），压缩文本从标题填充后开始
+                if (titleOffset > 0 && titleOffset >= exthEnd && titleLength > 0) {
+                    const paddedTitleEnd = titleOffset + ((titleLength + 5) >> 2) << 2; // ((len+2+3)>>2)<<2
+                    pos = Math.max(pos, paddedTitleEnd);
+                }
+                return pos;
+            }
+
             // 解析原生二进制 MOBI（PalmDB 容器 + 未压缩的头部区 + PalmDoc LZ77 压缩的正文）
             function parsePalmMobi(arrayBuffer) {
                 const data = new Uint8Array(arrayBuffer);
@@ -732,7 +750,7 @@
                 const rec0 = data.slice(recs[0], rec0end);
                 if (rec0.length < 20) throw new Error('MOBI 记录 0 长度不足');
 
-                const compression = readU16(rec0, 0);
+                let compression = readU16(rec0, 0);
                 if (compression === 0x0000) compression = 1; // 部分写入器用 0 表示未压缩
                 if (compression !== 1 && compression !== 2) {
                     throw new Error('不支持的 MOBI 压缩方式: 0x' + compression.toString(16));
@@ -744,19 +762,15 @@
 
                 // 权威字段偏移（参考 Calibre / KindleUnpack）：
                 // 20-24: MOBI 头长度 | 28-32: 文本编码 | 128-132: EXTH 标志（bit 0x40）
+                // 0xF2=242: trailing data flags | 0x24=36: version
                 const mobiHeaderLen = readU32(rec0, 20);
                 const textEncoding = readU32(rec0, 28);
                 const exthFlag = readU32(rec0, 128);
+                const trailFlags = readU16(rec0, 242);
+                const mobiVersion = readU32(rec0, 36);
+                const { trailers, multibyte } = palmGetTrailerInfo(mobiHeaderLen, mobiVersion, trailFlags);
 
-                let textStart = 16 + mobiHeaderLen;
-                if ((exthFlag & 0x40) === 0x40 && textStart + 8 <= rec0.length) {
-                    if (String.fromCharCode(rec0[textStart], rec0[textStart + 1], rec0[textStart + 2], rec0[textStart + 3]) === 'EXTH') {
-                        const exthLen = readU32(rec0, textStart + 4);
-                        textStart += ((exthLen + 3) >> 2) << 2; // EXTH 长度按 4 字节对齐
-                    }
-                }
-
-                // 正文记录数：PalmDoc 头偏移 8 的"文本记录数"（正文 = 记录 0 的文本段 + 记录 1..N）
+                // 正文记录数：PalmDoc 头偏移 8 的"文本记录数"（记录 1..N，不含记录 0）
                 let textRecCount = readU16(rec0, 8);
                 if (!(textRecCount >= 0 && textRecCount + 1 <= recs.length)) {
                     // 头信息不可信时，按"遇到索引/资源魔数即停止"扫描文本记录
@@ -772,26 +786,50 @@
                     }
                 }
 
-                // 逐记录解压（记录 0 取头部区之后的文本段）
-                const decode = compression === 2 ? palmdocDecode : (b) => b;
-                const chunks = [decode(rec0.subarray(textStart))];
+                const titleOffset = readU32(rec0, 84);
+                const titleLength = readU32(rec0, 88);
+                const textStart = computeTextStartInRec0(rec0, mobiHeaderLen, exthFlag, titleOffset, titleLength);
+
+                const encName = mobiEncodingName(readU32(rec0, 28));
+                if (!encName) throw new Error('不支持的 MOBI 文本编码');
+
+                // 逐记录解压（记录 0 的尾部（如有）+ 记录 1..textRecCount），裁剪 trailing data
+                // 然后拼接解压后的字节，再一次性解码（避免记录边界切断多字节字符）
+                const decodeRecord = (compressed) => compression === 2 ? palmdocDecode(palmTrimTrailing(compressed, trailers, multibyte)) : compressed;
+                const decChunks = [];
+
+                // 记录 0 的文本段（头部区之后的剩余字节），若存在则作为第一个文本块
+                if (textStart < rec0.length) {
+                    const raw = rec0.subarray(textStart);
+                    const dec = decodeRecord(raw);
+                    decChunks.push(dec);
+                }
+
+                // 记录 1..textRecCount
                 for (let i = 1; i <= textRecCount && i < recs.length; i++) {
                     const s = recs[i];
                     const e = i + 1 < recs.length ? recs[i + 1] : data.length;
                     if (s >= e) continue;
-                    chunks.push(decode(data.slice(s, e)));
+                    const raw = data.slice(s, e);
+                    const dec = decodeRecord(raw);
+                    decChunks.push(dec);
                 }
 
-                // 拼接全部正文并解码
+                // 拼接全部解压后的字节，再一次性解码
                 let total = 0;
-                for (const c of chunks) total += c.length;
+                for (const c of decChunks) total += c.length;
                 if (total === 0) throw new Error('MOBI 正文为空');
                 const rawText = new Uint8Array(total);
                 let off = 0;
-                for (const c of chunks) { rawText.set(c, off); off += c.length; }
+                for (const c of decChunks) { rawText.set(c, off); off += c.length; }
 
-                const decoded = decodeMobiText(rawText, textEncoding);
-                return htmlToText(decoded);
+                const fullText = decodeMobiText(rawText, textEncoding);
+                // Calibre: 去除末尾的 '#' 哨兵字符
+                if (fullText.endsWith('#')) fullText = fullText.slice(0, -1);
+                // 清理 NUL 字符
+                const cleanText = fullText.replace(/\0/g, '');
+
+                return htmlToText(cleanText);
             }
 
             // ----- 文本提取（PDF 分支：分栏检测 + 阈值归一化 + 连字符 + 页眉页脚）-----
@@ -1154,7 +1192,11 @@
                             losslessDone = true;
                             setProgress(90);
                         } catch (e) {
-                            console.warn('无损转换失败，回退到文本流程:', e);
+                            console.warn('无损转换失败:', e);
+                            // 对于 mobi/azw/azw3，无损转换失败不应静默回退到文本流程（会产出错误格式）
+                            if (['mobi', 'azw', 'azw3'].includes(fromFmt)) {
+                                throw new Error('无损转换失败：' + e.message + '（该格式不支持回退到文本转换）');
+                            }
                             losslessDone = false;
                             blob = null;
                         }
@@ -1268,6 +1310,97 @@
                 return new Uint8Array(out);
             }
 
+            // ----- PalmDoc trailing data (trimmers / multibyte) -----
+            function palmTrailingEntrySize(bytes) {
+                let num = 0;
+                const len = bytes.length;
+                if (len < 2) return 0;
+                const slice = bytes.subarray(Math.max(0, len - 4));
+                for (const v of slice) {
+                    if (v & 0x80) num = 0;
+                    num = (num << 7) | (v & 0x7f);
+                }
+                return num;
+            }
+
+            function palmGetTrailerInfo(mobiHeaderLen, mobiVersion, trailFlags) {
+                if (mobiHeaderLen < 0xE4 || mobiVersion < 5) return { trailers: 0, multibyte: 0 };
+                const flags = trailFlags || 0;
+                let trailers = 0;
+                let f = flags >> 1;
+                while (f > 1) {
+                    if (f & 2) trailers++;
+                    f >>= 1;
+                }
+                const multibyte = flags & 1;
+                return { trailers, multibyte };
+            }
+
+            function palmTrimTrailing(bytes, trailerCount, multibyte) {
+                let data = bytes;
+                for (let i = 0; i < trailerCount; i++) {
+                    if (data.length < 2) break;
+                    const n = palmTrailingEntrySize(data);
+                    if (n <= 0 || n > data.length) break;
+                    data = data.subarray(0, data.length - n);
+                }
+                if (multibyte && data.length > 0) {
+                    const n = (data[data.length - 1] & 0x3) + 1;
+                    if (n <= data.length) data = data.subarray(0, data.length - n);
+                }
+                return data;
+            }
+
+            // ----- 字节偏移重映射：原文 byte offset -> 新文本 byte offset -----
+            function buildOffsetMap(oldRecs, newRecs) {
+                const map = [];
+                for (let i = 0; i < oldRecs.length; i++) {
+                    const o = oldRecs[i];
+                    const n = newRecs[i] || '';
+                    const ob = new TextEncoder().encode(o);
+                    const nb = new TextEncoder().encode(n);
+                    // 最长公共前缀（按字符对齐的字节长度）
+                    let pref = 0;
+                    const maxPref = Math.min(ob.length, nb.length);
+                    while (pref < maxPref && ob[pref] === nb[pref]) pref++;
+                    // 回退到字符边界
+                    while (pref > 0 && (ob[pref] & 0xC0) === 0x80) pref--;
+                    while (pref > 0 && (nb[pref] & 0xC0) === 0x80) pref--;
+                    // 最长公共后缀
+                    let suff = 0;
+                    const maxSuff = Math.min(ob.length - pref, nb.length - pref);
+                    while (suff < maxSuff && ob[ob.length - 1 - suff] === nb[nb.length - 1 - suff]) suff++;
+                    while (suff > 0 && (ob[ob.length - 1 - suff] & 0xC0) === 0x80) suff--;
+                    while (suff > 0 && (nb[nb.length - 1 - suff] & 0xC0) === 0x80) suff--;
+                    map.push({ oldLen: ob.length, newLen: nb.length, pref, suff });
+                }
+                return map;
+            }
+
+            function mapOffset(offset, map, cumOld, cumNew) {
+                // find record index
+                let idx = 0;
+                while (idx < cumOld.length - 1 && offset >= cumOld[idx + 1]) idx++;
+                const m = map[idx];
+                const local = offset - cumOld[idx];
+                if (local <= m.pref) return cumNew[idx] + local;
+                if (local >= m.oldLen - m.suff) {
+                    const tail = m.oldLen - local;
+                    return cumNew[idx] + m.newLen - tail;
+                }
+                // 线性插值
+                const ratio = (local - m.pref) / Math.max(1, m.oldLen - m.pref - m.suff);
+                return cumNew[idx] + m.pref + Math.round(ratio * (m.newLen - m.pref - m.suff));
+            }
+
+            function remapFilepos(text, map, cumOld, cumNew) {
+                return text.replace(/filepos=(\d+)/g, (m, n) => {
+                    const oldOff = parseInt(n, 10);
+                    const newOff = mapOffset(oldOff, map, cumOld, cumNew);
+                    return 'filepos=' + String(newOff).padStart(n.length, '0');
+                });
+            }
+
             function mobiEncodingName(code) {
                 if (code === 1252 || code === 0) return 'windows-1252';
                 if (code === 65001 || code === 65000) return 'utf-8';
@@ -1329,11 +1462,24 @@
                 if (String.fromCharCode(rec0[16], rec0[17], rec0[18], rec0[19]) !== 'MOBI') return null;
                 const mobiHeaderLen = readU32(rec0, 20);
                 const textEncoding = readU32(rec0, 28);
-                const encNameTmp = mobiEncodingName(textEncoding);
+                const encName = mobiEncodingName(textEncoding);
+                if (!encName || encName === 'windows-1252') return null;
                 const exthFlag = readU32(rec0, 128);
-                const origTextRecCount = readU16(rec0, 8); // continuation count
+                const textRecCount = readU16(rec0, 8); // PalmDoc "text records" = 1..N
                 const exthStart = 16 + mobiHeaderLen;
-                // 转换 EXTH 中的可文本字段（书名、作者、出版社、主题、描述等），fix 元数据/目录标题
+                const trailFlags = readU16(rec0, 242);
+                const { trailers, multibyte } = palmGetTrailerInfo(mobiHeaderLen, readU32(rec0, 36), trailFlags);
+                const firstNontext = readU32(rec0, 80);
+                const titleOffset = readU32(rec0, 84);
+                const titleLength = readU32(rec0, 88);
+                const firstContent = readU16(rec0, 192);
+                const lastContent = readU16(rec0, 194);
+                const fcisOffset = readU32(rec0, 200);
+                const flisOffset = readU32(rec0, 208);
+                const srcsOffset = readU32(rec0, 224);
+                const mobiVersion = readU32(rec0, 36);
+
+                // ---- EXTH 转换（保持结构，仅转换字符串字段）----
                 if ((exthFlag & 0x40) === 0x40 && exthStart + 12 <= rec0.length &&
                     String.fromCharCode(rec0[exthStart], rec0[exthStart + 1], rec0[exthStart + 2], rec0[exthStart + 3]) === 'EXTH') {
                     const stringTypes = new Set([100,101,102,103,104,105,106,107,108,109,110,111,112,113,503,504,524,527,535]);
@@ -1348,9 +1494,9 @@
                         const rawVal = rec0.slice(off + 8, off + len);
                         let val = rawVal;
                         if (stringTypes.has(type)) {
-                            const txt = decodeForMobi(rawVal, encNameTmp || 'utf-8');
+                            const txt = decodeForMobi(rawVal, encName);
                             const convTxt = conv(txt);
-                            const enc = encodeForMobi(convTxt, encNameTmp || 'utf-8');
+                            const enc = encodeForMobi(convTxt, encName);
                             if (enc) val = enc;
                         }
                         entries.push({ type, val });
@@ -1380,92 +1526,160 @@
                     newRec0.set(after, before.length + paddedLen);
                     rec0 = newRec0;
                 }
-                let textStart = 16 + mobiHeaderLen;
-                if ((exthFlag & 0x40) === 0x40 && textStart + 8 <= rec0.length) {
-                    if (String.fromCharCode(rec0[textStart], rec0[textStart + 1], rec0[textStart + 2], rec0[textStart + 3]) === 'EXTH') {
-                        const exthLen = readU32(rec0, textStart + 4);
-                        textStart += ((exthLen + 3) >> 2) << 2;
-                    }
-                }
-                if (textStart > rec0.length) return null;
-                const encName = encNameTmp;
-                if (!encName || encName === 'windows-1252') return null;
-                const decode = (b) => (compression === 2 ? palmdocDecode(b) : b);
-                const origTextRecs = Math.max(1, Math.min(origTextRecCount + 1, recordCount - 1));
 
-                // 解码原书全部正文（按纪录拼接后再一次性解码，避免 record 边界 artifacts）
-                let total = 0;
-                const rawParts = [];
-                // 记录0正文段
-                rawParts.push(data.slice(rec0Start + textStart, recs[1]));
-                for (let i = 1; i < origTextRecs && i < recordCount; i++) {
+                // ---- 计算 record 0 中压缩文本的起始位置（考虑 EXTH 和标题）----
+                const textStart = computeTextStartInRec0(rec0, mobiHeaderLen, exthFlag, titleOffset, titleLength);
+                if (textStart > rec0.length) return null;
+
+                // ---- 逐记录解码文本记录：record 0 尾部（如有）+ 记录 1..textRecCount，含 trailing trim ----
+                const decodeRecord = (compressed) => compression === 2 ? palmdocDecode(palmTrimTrailing(compressed, trailers, multibyte)) : compressed;
+                const oldTextRecs = [];
+
+                // 记录 0 的文本段（若存在）
+                if (textStart < rec0.length) {
+                    const raw = rec0.subarray(textStart);
+                    const dec = decodeRecord(raw);
+                    const txt = decodeForMobi(dec, encName);
+                    oldTextRecs.push(txt);
+                }
+
+                // 记录 1..textRecCount
+                for (let i = 1; i <= textRecCount && i < recordCount; i++) {
                     const s = recs[i];
                     const e = i + 1 < recordCount ? recs[i + 1] : data.length;
-                    if (s >= e) continue;
-                    rawParts.push(data.slice(s, e));
+                    if (s >= e) { oldTextRecs.push(''); continue; }
+                    const raw = data.slice(s, e);
+                    const dec = decodeRecord(raw);
+                    const txt = decodeForMobi(dec, encName);
+                    oldTextRecs.push(txt);
                 }
-                for (const p of rawParts) total += p.length;
-                const fullBuf = new Uint8Array(total);
-                let off = 0;
-                for (const p of rawParts) { fullBuf.set(p, off); off += p.length; }
-                const decFull = (compression === 2 ? palmdocDecode(fullBuf) : fullBuf);
-                const fullText = decodeForMobi(decFull, encName);
-                const convText = conv(fullText);
 
-                // 按字符边界切块，保证每块可独立解码（不使用 trailing extra bytes）
-                function utf8Bytes(s) { return new TextEncoder().encode(s).length; }
-                const chunks = [];
-                let cur = '';
-                let curBytes = 0;
-                const chunkLimit = 4000;
-                for (const ch of convText) {
-                    const b = utf8Bytes(ch);
-                    if (curBytes > 0 && curBytes + b > chunkLimit) {
-                        chunks.push(cur);
-                        cur = ch;
-                        curBytes = b;
-                    } else {
-                        cur += ch;
-                        curBytes += b;
+                // ---- 检查是否有记录边界分割多字节字符（需回退整体转换）----
+                let needFallback = false;
+                for (let i = 0; i < oldTextRecs.length; i++) {
+                    const s = oldTextRecs[i];
+                    if (i > 0 && s.length > 0 && (s.charCodeAt(0) & 0xFC00) === 0xDC00) { needFallback = true; break; } // 低位代理对开头
+                    if (i < oldTextRecs.length - 1 && s.length > 0 && (s.charCodeAt(s.length - 1) & 0xFC00) === 0xD800) { needFallback = true; break; } // 高位代理对结尾
+                }
+
+                // ---- 转换正文 ----
+                let newTextRecs = [];
+                if (needFallback) {
+                    // 整体转换后按原字符数比例重分块
+                    const fullText = oldTextRecs.join('');
+                    const convFull = conv(fullText);
+                    // 计算各记录目标字符数（按原字符数比例）
+                    const totalOldChars = fullText.length;
+                    const charLengths = oldTextRecs.map(t => t.length);
+                    let charPos = 0;
+                    for (let i = 0; i < charLengths.length; i++) {
+                        const target = Math.round((charPos + charLengths[i]) * convFull.length / totalOldChars);
+                        newTextRecs.push(convFull.slice(charPos, target));
+                        charPos = target;
                     }
+                    if (charPos < convFull.length) newTextRecs[newTextRecs.length - 1] += convFull.slice(charPos);
+                } else {
+                    // 逐记录独立转换
+                    for (const t of oldTextRecs) newTextRecs.push(conv(t));
                 }
-                if (cur || chunks.length === 0) chunks.push(cur);
 
-                const encChunks = chunks.map(c => encodeForMobi(c, encName));
-                if (encChunks.some(x => !x)) return null;
-                const compChunks = encChunks.map(ec => (compression === 2 ? compressPalmDoc(ec) : ec));
-                const totalText = encChunks.reduce((a, b) => a + b.length, 0);
+                // ---- 计算偏移映射（用于 filepos= 等）----
+                const offMap = buildOffsetMap(oldTextRecs, newTextRecs);
+                const cumOld = [0];
+                const cumNew = [0];
+                for (let i = 0; i < offMap.length; i++) {
+                    cumOld.push(cumOld[cumOld.length - 1] + offMap[i].oldLen);
+                    cumNew.push(cumNew[cumNew.length - 1] + offMap[i].newLen);
+                }
 
-                // 记录0 + 正文 chunk 记录
-                const newRecords = [];
-                const rec0Header = rec0.subarray(0, textStart);
-                const firstComp = compChunks[0];
-                const rec0New = new Uint8Array(rec0Header.length + firstComp.length);
-                rec0New.set(rec0Header, 0);
-                rec0New.set(firstComp, rec0Header.length);
-                newRecords.push(rec0New);
-                for (let i = 1; i < compChunks.length; i++) newRecords.push(compChunks[i]);
+                // ---- 重编码并压缩每条文本记录 ----
+                const encRecs = [];
+                for (const t of newTextRecs) {
+                    const enc = encodeForMobi(t, encName);
+                    if (!enc) return null;
+                    const comp = compression === 2 ? compressPalmDoc(enc) : enc;
+                    encRecs.push(comp);
+                }
 
-                // 原文文本段末尾后的分隔/资源记录透传
-                const passStart = origTextRecs;
-                for (let i = passStart; i < recordCount; i++) {
+                // ---- 重建 record 0：头部 + EXTH + 标题 + padding ----
+                // 计算 EXTH 结束位置
+                let exthEnd = exthStart;
+                if ((exthFlag & 0x40) === 0x40 && exthStart + 8 <= rec0.length &&
+                    String.fromCharCode(rec0[exthStart], rec0[exthStart + 1], rec0[exthStart + 2], rec0[exthStart + 3]) === 'EXTH') {
+                    const exthLen = readU32(rec0, exthStart + 4);
+                    exthEnd = exthStart + ((exthLen + 3) & ~3);
+                }
+                const currentExth = rec0.slice(exthStart, exthEnd);
+
+                // 标题区：标题文本 + 填充到 4 字节对齐（KindleUnpack: ((len+2+3)>>2)<<2）
+                const fullNameBytes = rec0.slice(titleOffset, titleOffset + titleLength);
+                const fullNameText = new TextDecoder(encName).decode(fullNameBytes);
+                const newFullNameText = conv(fullNameText);
+                const newFullNameBytes = encodeForMobi(newFullNameText, encName);
+                const newTitlePaddedLen = ((newFullNameBytes.length + 5) >> 2) << 2; // ((len+2+3)>>2)<<2
+                const titleRegion = new Uint8Array(newTitlePaddedLen);
+                titleRegion.set(newFullNameBytes, 0);
+
+                // extra2 = rec0[titleOffset+titleLength .. textStart]（通常是零填充）
+                const extra2Start = titleOffset + titleLength;
+                const extra2End = textStart;
+                const extra2 = (extra2Start < extra2End) ? rec0.slice(extra2Start, extra2End) : new Uint8Array(0);
+
+                // 重建 record 0：[0..exthStart) + currentExth + titleRegion + extra2
+                const rec0Head = rec0.subarray(0, exthStart);
+                const rec0New = new Uint8Array(rec0Head.length + currentExth.length + titleRegion.length + extra2.length);
+                rec0New.set(rec0Head, 0);
+                rec0New.set(currentExth, rec0Head.length);
+                rec0New.set(titleRegion, rec0Head.length + currentExth.length);
+                rec0New.set(extra2, rec0Head.length + currentExth.length + titleRegion.length);
+
+                // ---- 更新 record 0 的关键字段 ----
+                const rv = new DataView(rec0New.buffer);
+                const newTotalTextLen = encRecs.reduce((a, b) => a + b.length, 0);
+                rv.setUint32(4, newTotalTextLen);          // textLength
+                rv.setUint16(8, textRecCount);             // textRecords (PalmDoc: 记录 1..N 的数量)
+                // firstNontext (0x50) 保持不变（记录索引不变）
+                // titleOffset / titleLength 更新
+                const newTitleOffset = exthStart + currentExth.length;
+                const newTitleLength = newFullNameBytes.length;
+                rv.setUint32(84, newTitleOffset);
+                rv.setUint32(88, newTitleLength);
+                // trailFlags 清零（我们不再产生 trailing data）
+                rv.setUint16(242, 0);
+
+                // ---- 组装新记录表：record 0 + textRecCount 条文本记录 + 其余记录原样透传 ----
+                const newRecords = [rec0New];
+                for (const cr of encRecs) newRecords.push(cr);
+                // 记录 (textRecCount+1) .. recordCount-1 原样透传（含 INDX, FLIS, FCIS, SRCS, 图片等）
+                for (let i = textRecCount + 1; i < recordCount; i++) {
                     const s = recs[i];
                     const e = i + 1 < recordCount ? recs[i + 1] : data.length;
                     if (s >= e) { newRecords.push(new Uint8Array(0)); continue; }
                     newRecords.push(data.slice(s, e));
                 }
 
-                // 更新 PalmDoc 正文长度与正文记录数字段
-                const rv = new DataView(rec0New.buffer);
-                rv.setUint32(4, totalText);
-                rv.setUint16(8, newRecords.length - 1);
-                const origFirstNonBook = readU32(rec0, 80);
-                const sepCount = Math.max(0, origFirstNonBook - origTextRecs);
-                if (origFirstNonBook >= origTextRecs) {
-                    rv.setUint32(80, newRecords.length + sepCount);
+                // ---- 处理 FCIS 记录：更新其中的 text_length 字段（如存在）----
+                if (fcisOffset < newRecords.length) {
+                    const fcisRec = newRecords[fcisOffset];
+                    if (fcisRec.length >= 0x18 && String.fromCharCode(fcisRec[0], fcisRec[1], fcisRec[2], fcisRec[3]) === 'FCIS') {
+                        const dv = new DataView(fcisRec.buffer, fcisRec.byteOffset, fcisRec.byteLength);
+                        dv.setUint32(0x14, newTotalTextLen); // FCIS text_length at +0x14
+                    }
                 }
 
-                // 重建文件
+                // ---- 处理 filepos= 重映射：在每条文本记录内替换 ----
+                const finalTextRecs = [];
+                for (let i = 0; i < encRecs.length; i++) {
+                    let txt = newTextRecs[i];
+                    txt = remapFilepos(txt, offMap, cumOld, cumNew);
+                    const enc = encodeForMobi(txt, encName);
+                    if (!enc) return null;
+                    finalTextRecs.push(compression === 2 ? compressPalmDoc(enc) : enc);
+                }
+                // 替换 newRecords 中的文本记录
+                for (let i = 0; i < finalTextRecs.length; i++) newRecords[i + 1] = finalTextRecs[i];
+
+                // ---- 重建文件 ----
                 const newHeader = new Uint8Array(78 + newRecords.length * 8);
                 newHeader.set(data.slice(0, 78), 0);
                 const dvHeader = new DataView(newHeader.buffer);
@@ -1492,24 +1706,86 @@
                 const buf = await file.arrayBuffer();
                 const bytes = new Uint8Array(buf);
                 const ext = file.name.split('.').pop().toLowerCase();
-                const text = (ext === 'html' || ext === 'htm')
-                    ? decodeHtmlBytes(bytes)
-                    : decodeBytes(bytes);
-                return new Blob([conv(text)], { type: file.type || 'text/plain;charset=utf-8' });
+                // 保留原始编码/BOM
+                let { text, encoding, bom } = decodeWithEncodingInfo(bytes, ext === 'html' || ext === 'htm');
+                const outText = conv(text);
+                const outBytes = encodeWithEncoding(outText, encoding, bom);
+                return new Blob([outBytes], { type: file.type || 'text/plain;charset=' + encoding });
+            }
+
+            function decodeWithEncodingInfo(bytes, isHtml) {
+                const bom = hasBom(bytes);
+                let payload = bytes;
+                let enc = bom;
+                if (!enc) {
+                    if (isHtml) enc = detectHtmlCharset(bytes);
+                    if (!enc) {
+                        // 尝试 UTF-8, GB18030, Big5, Latin1
+                        const attempts = ['utf-8', 'gb18030', 'big5'];
+                        for (const a of attempts) {
+                            try { new TextDecoder(a, { fatal: true }).decode(bytes); enc = a; break; } catch (e) {}
+                        }
+                    }
+                }
+                if (!enc) enc = 'latin1';
+                const txt = new TextDecoder(normalizeEncodingName(enc)).decode(payload.slice(bom ? (bom === 'utf-8' ? 3 : 2) : 0));
+                return { text: txt, encoding: enc, bom };
+            }
+
+            function encodeWithEncoding(text, encoding, bom) {
+                const normEnc = normalizeEncodingName(encoding);
+                let out = new TextEncoder().encode(text); // TextEncoder 仅支持 UTF-8
+                if (normEnc !== 'utf-8' && normEnc !== 'utf-16le' && normEnc !== 'utf-16be') {
+                    // 非 UTF 编码：作为 UTF-8 输出（现代阅读器均支持），或返回原编码
+                    out = new TextEncoder().encode(text);
+                }
+                if (bom === 'utf-8') out = concatBytes([new Uint8Array([0xEF,0xBB,0xBF]), out]);
+                else if (bom === 'utf-16le') out = concatBytes([new Uint8Array([0xFF,0xFE]), out]);
+                else if (bom === 'utf-16be') out = concatBytes([new Uint8Array([0xFE,0xFF]), out]);
+                return out;
+            }
+
+            function concatBytes(arrays) {
+                const total = arrays.reduce((a, b) => a + b.length, 0);
+                const out = new Uint8Array(total);
+                let off = 0;
+                for (const a of arrays) { out.set(a, off); off += a.length; }
+                return out;
             }
 
             async function convertEpubLossless(file, conv) {
                 const zip = await JSZip.loadAsync(file);
                 const paths = Object.keys(zip.files);
+                // 先收集要转换的条目：XHTML/HTML 内容文件，排除 container.xml, mimetype, .opf, .ncx（除非它们也是内容）
+                const contentEntries = [];
                 for (const pth of paths) {
                     const entry = zip.files[pth];
                     if (entry.dir) continue;
-                    if (!/\.(x?html?|htm|xml)$/i.test(pth)) continue;
-                    let t = '';
-                    try { t = await entry.async('string'); } catch (e) { continue; }
-                    zip.file(pth, conv(t));
+                    const lower = pth.toLowerCase();
+                    if (/\.(x?html?|htm)$/i.test(lower)) {
+                        contentEntries.push(pth);
+                    }
                 }
-                return await zip.generateAsync({ type: 'blob', mimeType: 'application/epub+zip' });
+                // 按原顺序处理（JSZip 对象键顺序不保证，但通常是读取顺序）
+                for (const pth of contentEntries) {
+                    const entry = zip.files[pth];
+                    let t = '';
+                    try {
+                        const bytes = await entry.async('uint8array');
+                        const enc = detectHtmlCharset(bytes) || 'utf-8';
+                        t = new TextDecoder(normalizeEncodingName(enc), { fatal: false }).decode(bytes);
+                        zip.file(pth, conv(t));
+                    } catch (e) {
+                        // 忽略无法读取的条目
+                    }
+                }
+                // 生成 EPUB：保持 mimetype 为第一个且 STORED
+                return await zip.generateAsync({
+                    type: 'blob',
+                    mimeType: 'application/epub+zip',
+                    compression: 'DEFLATE',
+                    compressionOptions: { level: 6 }
+                });
             }
 
             async function convertKindleLossless(file, conv) {
