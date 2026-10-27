@@ -1401,6 +1401,124 @@
                 });
             }
 
+            // ========== KF8 / AZW3 (联合文件) 支持 ==========
+            // 解析 FDST (流表)：每项 8 字节 = start(4) + length(4)
+            function parseFdst(fdstBytes) {
+                if (fdstBytes.length < 8 || String.fromCharCode(fdstBytes[0], fdstBytes[1], fdstBytes[2], fdstBytes[3]) !== 'FDST') return null;
+                const view = new DataView(fdstBytes.buffer, fdstBytes.byteOffset, fdstBytes.byteLength);
+                const headerLen = view.getUint32(4);
+                const numSections = view.getUint32(8);
+                const secStart = 12; // FDST 头部后直接是 section 表
+                const flows = [];
+                for (let i = 0; i < numSections; i++) {
+                    const start = view.getUint32(secStart + i * 8);
+                    const len = view.getUint32(secStart + i * 8 + 4);
+                    flows.push({ start, len });
+                }
+                return { headerLen, flows };
+            }
+
+            // 解析 FCIS (Font/Content Index) - 包含文本长度与块偏移
+            function parseFcis(fcisBytes) {
+                if (fcisBytes.length < 0x30) return null;
+                const view = new DataView(fcisBytes.buffer, fcisBytes.byteOffset, fcisBytes.byteLength);
+                if (String.fromCharCode(fcisBytes[0], fcisBytes[1], fcisBytes[2], fcisBytes[3]) !== 'FCIS') return null;
+                const headerLen = view.getUint32(4);
+                const textLength = view.getUint32(0x14);
+                const numEntries = view.getUint32(0x28);
+                const entries = [];
+                for (let i = 0; i < numEntries; i++) {
+                    const off = 0x30 + i * 12; // 每项 12 字节: id(4) + offset(4) + len(4)
+                    if (off + 12 > fcisBytes.length) break;
+                    entries.push({
+                        id: view.getUint32(off),
+                        offset: view.getUint32(off + 4),
+                        length: view.getUint32(off + 8)
+                    });
+                }
+                return { headerLen, textLength, entries };
+            }
+
+            // 解析 FLIS (Flow List) - 包含流信息
+            function parseFlis(flisBytes) {
+                if (flisBytes.length < 0x24) return null;
+                const view = new DataView(flisBytes.buffer, flisBytes.byteOffset, flisBytes.byteLength);
+                if (String.fromCharCode(flisBytes[0], flisBytes[1], flisBytes[2], flisBytes[3]) !== 'FLIS') return null;
+                const headerLen = view.getUint32(4);
+                const textLength = view.getUint32(0x10);
+                const numBlocks = view.getUint32(0x18);
+                return { headerLen, textLength, numBlocks };
+            }
+
+            // KF8 文本块解压（Huffman 或 PalmDoc）
+            function decompressKf8Block(blockBytes, compression, huffTables) {
+                if (compression === 1) return blockBytes; // 无压缩
+                if (compression === 2) return palmTrimTrailing(blockBytes, 2, 1); // PalmDoc + trim
+                // KF8 通常用 Huffman (compression=0x101), 这里简化处理
+                return blockBytes;
+            }
+
+            // 重建 FDST（更新流偏移）
+            function rebuildFdst(fdstBytes, flowMap) {
+                const out = new Uint8Array(fdstBytes.length);
+                out.set(fdstBytes);
+                const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+                const headerLen = view.getUint32(4);
+                const numSections = view.getUint32(8);
+                const secStart = 12;
+                for (let i = 0; i < numSections; i++) {
+                    const oldStart = view.getUint32(secStart + i * 8);
+                    if (flowMap.has(oldStart)) {
+                        view.setUint32(secStart + i * 8, flowMap.get(oldStart));
+                    }
+                }
+                return out;
+            }
+
+            // 重建 FCIS（更新文本长度与条目偏移）
+            function rebuildFcis(fcisBytes, newTextLength, entryOffsetMap) {
+                const out = new Uint8Array(fcisBytes.length);
+                out.set(fcisBytes);
+                const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+                view.setUint32(0x14, newTextLength);
+                const numEntries = view.getUint32(0x28);
+                for (let i = 0; i < numEntries; i++) {
+                    const off = 0x30 + i * 12;
+                    const oldOffset = view.getUint32(off + 4);
+                    if (entryOffsetMap.has(oldOffset)) {
+                        view.setUint32(off + 4, entryOffsetMap.get(oldOffset));
+                    }
+                }
+                return out;
+            }
+
+            // 重建 FLIS
+            function rebuildFlis(flisBytes, newTextLength) {
+                const out = new Uint8Array(flisBytes.length);
+                out.set(flisBytes);
+                const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+                view.setUint32(0x10, newTextLength);
+                return out;
+            }
+
+            // 计算 record 0 中压缩文本的起始位置（考虑 EXTH 和标题区域）
+            function computeTextStartInRec0(rec0, mobiHeaderLen, exthFlag, titleOffset, titleLength) {
+                let pos = 16 + mobiHeaderLen;
+                if ((exthFlag & 0x40) === 0x40 && pos + 8 <= rec0.length) {
+                    if (String.fromCharCode(rec0[pos], rec0[pos + 1], rec0[pos + 2], rec0[pos + 3]) === 'EXTH') {
+                        const exthLen = readU32(rec0, pos + 4);
+                        pos += ((exthLen + 3) >> 2) << 2; // EXTH 长度按 4 字节对齐
+                    }
+                }
+                const exthEnd = pos;
+                // 如果标题在 record 0 中（titleOffset >= exthEnd 且 titleLength > 0），压缩文本从标题填充后开始
+                if (titleOffset > 0 && titleOffset >= exthEnd && titleLength > 0) {
+                    const paddedTitleEnd = titleOffset + ((titleLength + 5) >> 2) << 2; // ((len+2+3)>>2)<<2
+                    pos = Math.max(pos, paddedTitleEnd);
+                }
+                return pos;
+            }
+
             function mobiEncodingName(code) {
                 if (code === 1252 || code === 0) return 'windows-1252';
                 if (code === 65001 || code === 65000) return 'utf-8';
@@ -1479,6 +1597,11 @@
                 const srcsOffset = readU32(rec0, 224);
                 const mobiVersion = readU32(rec0, 36);
 
+                // ---- KF8 检测：存在 FDST 记录即为联合/纯 KF8 ----
+                const fdstOffset = readU32(rec0, 192); // KF8 复用 firstContent 位置
+                const fdstCount = readU32(rec0, 196);  // KF8 复用 lastContent 位置
+                const isKf8 = fdstOffset > 0 && fdstOffset < recordCount && fdstCount > 0;
+
                 // ---- EXTH 转换（保持结构，仅转换字符串字段）----
                 if ((exthFlag & 0x40) === 0x40 && exthStart + 12 <= rec0.length &&
                     String.fromCharCode(rec0[exthStart], rec0[exthStart + 1], rec0[exthStart + 2], rec0[exthStart + 3]) === 'EXTH') {
@@ -1525,6 +1648,64 @@
                     newRec0.set(newExth, before.length);
                     newRec0.set(after, before.length + paddedLen);
                     rec0 = newRec0;
+                }
+
+                // ---- KF8 文本块处理（联合文件的 KF8 部分）----
+                let kf8Blocks = [];        // {recIdx, raw, dec, txt, newTxt, enc, comp}
+                let kf8FlowMap = new Map();    // oldFlowStart -> newFlowStart
+                let kf8EntryOffsetMap = new Map(); // oldEntryOffset -> newEntryOffset
+                let kf8TotalOldLen = 0;
+                let kf8TotalNewLen = 0;
+
+                if (isKf8 && fdstOffset < recordCount) {
+                    const fdstRec = data.slice(recs[fdstOffset], fdstOffset + 1 < recordCount ? recs[fdstOffset + 1] : data.length);
+                    const fdst = parseFdst(fdstRec);
+                    if (fdst) {
+                        // 解析 FCIS/FLIS（如果存在）
+                        let fcis = null, flis = null;
+                        if (fcisOffset < recordCount) {
+                            const fcisRec = data.slice(recs[fcisOffset], fcisOffset + 1 < recordCount ? recs[fcisOffset + 1] : data.length);
+                            fcis = parseFcis(fcisRec);
+                        }
+                        if (flisOffset < recordCount) {
+                            const flisRec = data.slice(recs[flisOffset], flisOffset + 1 < recordCount ? recs[flisOffset + 1] : data.length);
+                            flis = parseFlis(flisRec);
+                        }
+
+                        // FDST flows 指向文本块记录（通常在 MOBI6 文本记录之后）
+                        // 这里简化：遍历所有记录，识别 KF8 文本块（非 PalmDoc 压缩、非图片、非索引）
+                        // 实际 KF8 文本块由 FDST flows 定位，这里按记录类型启发式识别
+                        let flowPos = 0;
+                        for (const flow of fdst.flows) {
+                            const flowStart = flow.start;
+                            const flowLen = flow.len;
+                            // 寻找包含此流的记录（简化：按字节偏移匹配记录）
+                            // 实际应解析记录边界，这里按流位置处理
+                            kf8FlowMap.set(flowStart, flowPos);
+                            flowPos += flowLen;
+                        }
+
+                        // 提取 KF8 文本块：遍历 FDST 之后的记录，解压非 PalmDoc 的文本
+                        // 启发式：记录魔数不是 INDX/FCIS/FLIS/SRCS/图片的，且长度 > 100
+                        const nonTextMagics = ['INDX', 'IDXT', 'FCIS', 'FLIS', 'SRCS', 'CMET', 'FONT', 'AUDI', 'VIDE', 'RESC', 'HUFF', 'CDIC'];
+                        for (let i = fdstOffset + 1; i < recordCount; i++) {
+                            const s = recs[i];
+                            const e = i + 1 < recordCount ? recs[i + 1] : data.length;
+                            if (s >= e) continue;
+                            const magic = String.fromCharCode(data[s], data[s + 1], data[s + 2], data[s + 3]);
+                            if (nonTextMagics.includes(magic)) continue;
+                            // 可能是 KF8 文本块
+                            const raw = data.slice(s, e);
+                            // KF8 文本通常是未压缩或 Huffman 压缩的 HTML
+                            // 这里简化：尝试作为 UTF-8 解码
+                            try {
+                                const txt = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+                                if (txt.length > 50 && /<[a-z]/.test(txt)) {
+                                    kf8Blocks.push({ recIdx: i, raw, txt, magic });
+                                }
+                            } catch (e) { /* 非 UTF-8 文本，跳过 */ }
+                        }
+                    }
                 }
 
                 // ---- 计算 record 0 中压缩文本的起始位置（考虑 EXTH 和标题）----
@@ -1583,6 +1764,15 @@
                     for (const t of oldTextRecs) newTextRecs.push(conv(t));
                 }
 
+                // ---- KF8 文本块转换 ----
+                const kf8NewBlocks = [];
+                for (const blk of kf8Blocks) {
+                    const newTxt = conv(blk.txt);
+                    kf8NewBlocks.push({ ...blk, newTxt });
+                    kf8TotalOldLen += blk.txt.length;
+                    kf8TotalNewLen += newTxt.length;
+                }
+
                 // ---- 计算偏移映射（用于 filepos= 等）----
                 const offMap = buildOffsetMap(oldTextRecs, newTextRecs);
                 const cumOld = [0];
@@ -1635,7 +1825,7 @@
 
                 // ---- 更新 record 0 的关键字段 ----
                 const rv = new DataView(rec0New.buffer);
-                const newTotalTextLen = encRecs.reduce((a, b) => a + b.length, 0);
+                const newTotalTextLen = encRecs.reduce((a, b) => a + b.length, 0) + kf8NewBlocks.reduce((a, b) => a + b.newTxt.length, 0);
                 rv.setUint32(4, newTotalTextLen);          // textLength
                 rv.setUint16(8, textRecCount);             // textRecords (PalmDoc: 记录 1..N 的数量)
                 // firstNontext (0x50) 保持不变（记录索引不变）
@@ -1647,9 +1837,17 @@
                 // trailFlags 清零（我们不再产生 trailing data）
                 rv.setUint16(242, 0);
 
-                // ---- 组装新记录表：record 0 + textRecCount 条文本记录 + 其余记录原样透传 ----
+                // ---- 组装新记录表：record 0 + textRecCount 条文本记录 + KF8 块 + 其余记录原样透传 ----
                 const newRecords = [rec0New];
                 for (const cr of encRecs) newRecords.push(cr);
+                // KF8 文本块（重新编码压缩）
+                for (const blk of kf8NewBlocks) {
+                    const enc = encodeForMobi(blk.newTxt, encName);
+                    if (enc) {
+                        const comp = compression === 2 ? compressPalmDoc(enc) : enc;
+                        newRecords.push(comp);
+                    }
+                }
                 // 记录 (textRecCount+1) .. recordCount-1 原样透传（含 INDX, FLIS, FCIS, SRCS, 图片等）
                 for (let i = textRecCount + 1; i < recordCount; i++) {
                     const s = recs[i];
@@ -1664,6 +1862,31 @@
                     if (fcisRec.length >= 0x18 && String.fromCharCode(fcisRec[0], fcisRec[1], fcisRec[2], fcisRec[3]) === 'FCIS') {
                         const dv = new DataView(fcisRec.buffer, fcisRec.byteOffset, fcisRec.byteLength);
                         dv.setUint32(0x14, newTotalTextLen); // FCIS text_length at +0x14
+                        // KF8 FCIS entries: 更新条目偏移
+                        const numEntries = dv.getUint32(0x28);
+                        for (let i = 0; i < numEntries; i++) {
+                            const off = 0x30 + i * 12;
+                            const oldOff = dv.getUint32(off + 4);
+                            if (kf8EntryOffsetMap.has(oldOff)) {
+                                dv.setUint32(off + 4, kf8EntryOffsetMap.get(oldOff));
+                            }
+                        }
+                    }
+                }
+
+                // ---- 处理 FLIS ----
+                if (flisOffset < newRecords.length) {
+                    const flisRec = newRecords[flisOffset];
+                    if (flisRec.length >= 0x18 && String.fromCharCode(flisRec[0], flisRec[1], flisRec[2], flisRec[3]) === 'FLIS') {
+                        newRecords[flisOffset] = rebuildFlis(flisRec, newTotalTextLen);
+                    }
+                }
+
+                // ---- 处理 FDST ----
+                if (isKf8 && fdstOffset < newRecords.length) {
+                    const fdstRec = newRecords[fdstOffset];
+                    if (fdstRec.length >= 8 && String.fromCharCode(fdstRec[0], fdstRec[1], fdstRec[2], fdstRec[3]) === 'FDST') {
+                        newRecords[fdstOffset] = rebuildFdst(fdstRec, kf8FlowMap);
                     }
                 }
 
