@@ -1979,17 +1979,18 @@
             async function convertEpubLossless(file, conv) {
                 const zip = await JSZip.loadAsync(file);
                 const paths = Object.keys(zip.files);
-                // 先收集要转换的条目：XHTML/HTML 内容文件，排除 container.xml, mimetype, .opf, .ncx（除非它们也是内容）
+                // 要转换的条目：XHTML/HTML/HTM 正文、OPF 元数据、NCX 目录、XML/SVG 可能含文本
+                const convertExt = /\.(x?html?|htm|opf|ncx|xml|svg)$/i;
                 const contentEntries = [];
                 for (const pth of paths) {
                     const entry = zip.files[pth];
                     if (entry.dir) continue;
                     const lower = pth.toLowerCase();
-                    if (/\.(x?html?|htm)$/i.test(lower)) {
+                    if (convertExt.test(lower)) {
                         contentEntries.push(pth);
                     }
                 }
-                // 按原顺序处理（JSZip 对象键顺序不保证，但通常是读取顺序）
+                // 按原顺序处理
                 for (const pth of contentEntries) {
                     const entry = zip.files[pth];
                     let t = '';
@@ -1997,7 +1998,21 @@
                         const bytes = await entry.async('uint8array');
                         const enc = detectHtmlCharset(bytes) || 'utf-8';
                         t = new TextDecoder(normalizeEncodingName(enc), { fatal: false }).decode(bytes);
-                        zip.file(pth, conv(t));
+                        // OPF/NCX/XML/SVG：用正则分离标签与文本，仅转换文本内容，保留标签结构
+                        if (/\.(opf|ncx|xml|svg)$/i.test(pth)) {
+                            // 分离：标签 <...> 与 标签间文本
+                            const parts = t.split(/(<[^>]+>)/);
+                            for (let i = 0; i < parts.length; i++) {
+                                if (i % 2 === 0) { // 偶数索引 = 标签间文本
+                                    parts[i] = conv(parts[i]);
+                                }
+                            }
+                            t = parts.join('');
+                            zip.file(pth, t);
+                        } else {
+                            // HTML 正文直接转换
+                            zip.file(pth, conv(t));
+                        }
                     } catch (e) {
                         // 忽略无法读取的条目
                     }
